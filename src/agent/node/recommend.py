@@ -1,0 +1,333 @@
+import os
+import uuid
+from typing import Optional
+
+from dotenv import load_dotenv
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain_community.tools import QuerySQLDatabaseTool
+from langchain_community.utilities import SQLDatabase
+from langchain_core.messages import (
+    filter_messages,
+    HumanMessage,
+    SystemMessage,
+    AIMessage,
+)
+from langchain_core.messages.tool import tool_call
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
+from langgraph.store.base import BaseStore
+from langgraph.types import interrupt
+from pydantic import BaseModel, Field
+from structlog.tracebacks import extract
+
+from src.agent.common.context import ContextSchema
+from src.agent.common.llm import model
+from src.agent.common.store import UserPreferences
+from src.agent.state.recommend import RecommendState, get_recommend_info
+
+
+class UserInfo(BaseModel):
+    """用户的博客阅读需求信息"""
+
+    topic: Optional[str] = Field(
+        default=None,
+        description="用户想要阅读的博客领域/分类，例如：人工智能、前端开发、数据库、职场成长",
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="博客栏目/专栏名称，例如：LangGraph实战、源码剖析、每周随笔、面试笔记",
+    )
+    word_count_min: Optional[int] = Field(
+        default=None,
+        description="用户能接受的最少字数，单位为字。如果是xx字以内，要设置最小值为0",
+    )
+    word_count_max: Optional[int] = Field(
+        default=None,
+        description="用户能接受的最多字数，单位为字。如果是xx字以上，最大值设置为20000",
+    )
+    blog_type: Optional[str] = Field(
+        default=None,
+        description="文章类型，例如：教程、实战、原理剖析、随笔、踩坑记录、工具介绍",
+    )
+    tags: Optional[str] = Field(
+        default=None,
+        description="文章标签，例如：LangGraph、RAG、Agent、Docker、性能优化",
+    )
+    blog_count: Optional[int] = Field(
+        default=None, description="需要推荐的博客文章数量"
+    )
+    others: Optional[str] = Field(
+        default=None,
+        description="特殊要求，例如：带代码示例、有架构图、附参考文献、适合新手、有demo仓库等",
+    )
+
+
+def collect_user_info(
+    state: RecommendState, runtime: Runtime[ContextSchema], *, store: BaseStore
+):
+    """收集用户希望的推荐信息"""
+
+    # 1. 获取需要被解析的数据：最新的用户消息 + 用户的偏好数据
+    # 场景1：
+    # 最新的用户消息： 人工智能 3篇
+    # 用户的偏好数据： 字数 1000-2000字
+    user_messages = filter_messages(state["messgaes"], include_type="human")
+    pref = state.get("user_preferences")
+    if pref and (pref.get("word_count_min") or pref.get("word_count_max")):
+        # 偏好中包含最少和最多字数
+        extract_messages = [
+            HumanMessage(
+                content="用户的历史偏好信息如下："
+                f"1. 最少字数：{pref.get('word_count_min')}"
+                f"2. 最多字数：{pref.get('word_count_max')}"
+            ),
+            user_messages[-1],
+        ]
+    else:  # 无偏好数据
+        extract_messages = user_messages[-1]
+
+    # 2. 提取信息(LLM结构化返回)
+    # 拓展：将信息与数据库表中的字段进行映射
+    def extract_info(messages) -> UserInfo:
+        system_message = SystemMessage(
+            content="""
+你是一个博客阅读需求信息提取专家。请从用户的描述与历史信息中提取博客阅读相关信息。
+如果用户历史偏好信息与最新用户消息冲突，以最新的用户消息为主。
+只提取用户明确提到的信息，不要猜测或推断。
+如果某个信息用户没有提到，就返回null。
+注意字数的单位可能是字、千字、万字等，请统一转换为字。
+如果用户提到篇幅范围，请分别提取最少字数和最多字数。
+如果用户提到推荐几篇文章，提取blog_count字段。"""
+        )
+        return model.with_structured_output(schema=UserInfo).invoke(
+            [SystemMessage] + messages
+        )
+
+    # 更新状态函数
+    def update_state(current_state: dict, info: UserInfo) -> dict:
+        if not info:
+            return current_state
+
+        user_info_dict = info.model_dump(exclude_none=True)
+        current_state.update(user_info_dict)
+        return current_state
+
+    # 根据历史偏好和用户消息提取消息
+    updated_state = {}
+    extracted_info = extract_info(extract_messages)
+    updated_state = update_state(update_state, extracted_info)
+
+    # 3. 中断咨询推荐的必须参数
+    # 场景2：
+    # 最新的用户消息：给我推荐几篇博客（并未表明推荐领域，模糊推荐）
+    # 询问用户意向领域
+
+    # 检查是否缺失关键信息: 领域、字数范围
+    missing_info = []
+    if not updated_state.get("topic"):
+        missing_info.append("**领域/分类**")
+    if (
+        updated_state.get("word_count_min") is None
+        or updated_state.get("word_count_max") is None
+    ):
+        missing_info.append("**字数范围**")
+
+    if missing_info:
+        prompt = f"为了给您推荐合适的博客文章，请提供以下信息:{'，'.join(missing_info)}和其它信息。\n"
+        prompt += (
+            "如果您不想提供，请输入'**不提供**',我会根据已有信息为您推荐博客文章。"
+        )
+        # 根据缺失的信息进行中断
+        answer = interrupt(prompt)
+        if str(answer).strip() == "不提供":
+            # 已经缺失关键信息，而且用户还不提供。需要给关键信息设置默认值
+            if not updated_state.get("topic"):
+                updated_state["topic"] = "随机领域"
+            if not updated_state.get("word_count_min"):
+                updated_state["word_count_min"] = 500
+            if not updated_state.get("word_count_max"):
+                updated_state["word_count_max"] = 5000
+            if not updated_state.get("blog_count"):
+                updated_state["blog_count"] = 5
+        else:
+            # 缺失关键信息，但用户已经补充
+            # 将answer构建为HumanMessage
+            user_response_msg = HumanMessage(content=str(answer))
+            extracted_info = extract_info(user_response_msg)
+            updated_state = update_state(updated_state, extracted_info)
+
+    # 4. 持久化处理：更新字数偏好
+    # 场景3：
+    # 最新的用户消息：人工智能 3篇  字数0-5000字
+    # 用户的偏好数据：字数 1000-2000字
+    if updated_state.get("word_count_min") or updated_state.get("word_count_max"):
+        # 有可能会更新
+        user_id = runtime.context.get("user_id")
+        namespace = (user_id, "preferences")
+        prefs_result = store.search(namespace)
+        if len(prefs_result) == 0:
+            # 新增
+            prefs = UserPreferences(
+                word_count_min=updated_state.get("word_count_min"),
+                word_count_max=updated_state.get("word_count_max"),
+            )
+            store.put(namespace, str(uuid.uuid4()), prefs.model_dump(exclude_none=True))
+            updated_state["user_preferences"] = prefs.model_dump(exclude_none=True)
+        else:
+            prefs = prefs_result[0].value
+            store_min = prefs.get("word_count_min")
+            store_max = prefs.get("word_count_max")
+            cur_min = updated_state.get("word_count_min")
+            cur_max = updated_state.get("word_count_max")
+            update_min = False  # 是否更新最少字数
+            update_max = False  # 是否更新最多字数
+            if store_min is not None and cur_min is not None and cur_min < store_min:
+                # 都不为空，就比较
+                update_min = True
+            elif store_min is None and cur_min is not None:
+                # store 没有，但 cur 有
+                update_min = True
+
+            if store_max is not None and cur_max is not None and cur_max > store_max:
+                update_max = True
+            elif store_max is None and cur_max is not None:
+                update_max = True
+
+            if update_min or update_max:
+                if update_min:
+                    prefs["word_count_min"] = cur_min
+                if update_max:
+                    prefs["word_count_max"] = cur_max
+
+                store.put(
+                    namespace,
+                    prefs_result[0].key,  # 根据查询到的key进行更新
+                    prefs,
+                )
+                updated_state["user_preferences"] = prefs
+
+    # 5. 准备最终的消息，并更新
+    updated_state["messages"] = [
+        HumanMessage(content=get_recommend_info(updated_state))
+    ]
+    print(
+        f"已收集用户信息：\n领域：{updated_state.get('topic')}"
+        f"栏目：{updated_state.get('category')}"
+        f"字数：{updated_state.get('word_count_min')}-{updated_state.get('word_count_max')}字"
+        f"文章数：{updated_state.get('blog_count')}"
+    )
+
+    # 返回：覆盖了推荐参数和偏好数据，更新了消息列表
+    return updated_state
+
+
+# 使用.env环境变量(win)
+load_dotenv()
+db_user = os.getenv("DB_USER")
+db_password = os.getenv("DB_PASSWORD")
+db_host = os.getenv("DB_HOST")
+db_port = os.getenv("DB_PORT")
+db_name = os.getenv("DB_NAME")
+db = SQLDatabase.from_uri(
+    f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+)
+
+# 获取数据库工具
+toolkit = SQLDatabaseToolkit(db=db, llm=model)
+tools = toolkit.get_tools()
+
+# 节点：获取表信息
+get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
+get_schema_node = ToolNode([get_schema_tool], name="get_schema")
+
+# 节点：执行sql查询
+run_query_tool = next(tool for tool in tools if tool.name == "run_db_query")
+run_query_node = ToolNode([run_query_tool], name="run_query")
+
+
+# 节点：获取全量表
+def list_tables(state: RecommendState):
+    # 1. 获取AIMessage(tool_calls)
+    tool_call = {
+        "name": "sql_db_list_tables",
+        "args": {},
+        "id": "123123",
+        "type": "tool_call",
+    }
+    # 模拟必定调用工具
+    tool_call_message = AIMessage(content="", tool_call=[tool_call])
+
+    # 2. 手动调用工具：sql_db_list_tables
+    list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
+    tool_message = list_tables_tool.invoke(tool_call)
+
+    # 整合结果
+    response = AIMessage(content=f"可用的表:{tool_message.content}")
+    return {"messages": [tool_call_message, tool_message, response]}
+
+
+# 节点：绑定工具（获取表信息），让LLM将来必定执行工具节点
+def call_get_schema(state: RecommendState):
+    llm_with_tools = model.bind_tools([get_schema_node], tool_choice="any")
+    # llm 根据历史消息筛选表，并获取需要的表信息
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+# 节点：生成SQL + 整合结果
+def generate_query(state: RecommendState):
+    generate_query_system_prompt = """
+    您是一个设计用于与SQL数据库交互的代理。
+    给定一个输入问题，创建一个语法正确的{dialect}查询来运行，然后查看查询的结果并返回答案。
+    需要根据rows from table的示例设置真实查询的值。
+    除非用户指定了他们希望获得的特定数量的示例，否则始终将查询限制为最多{top_k}个结果。
+    您可以按相关列对结果排序，以返回最感兴趣的结果。不要查询特定表中的所有列，只查询给定问题的相关列。
+    不要对数据库做任何DML语句（INSERT， UPDATE， DELETE， DROP等)。
+            """
+    system_prompt = generate_query_system_prompt.format(
+        dialect=db.dialect, top_k=state.get("blog_count", 5)
+    )
+    system_message = SystemMessage(content=system_prompt)
+    llm_with_tools = model.bind_tools([run_query_tool])
+    return {"messages": [llm_with_tools.invoke([system_message] + state["messages"])]}
+
+    # QuerySQLDatabaseTool
+    # tool_call: {
+    #     "name": sql_db_query  # 运行sql
+    #     "args": {"query": "select ....."}              # sql
+    #     "id":
+    # }
+
+
+def check_query(state: RecommendState):
+    # 走到这个节点，上一个节点必然是generate_query，并且最新的消息必然是AIMessage(tool_call)
+
+    check_query_system_prompt = """
+你是一个非常注重细节的SQL专家。仔细检查{dialect}查询中的常见错误，包括：
+-使用NULL值的NOT IN
+-在应该使用UNION ALL时使用UNION
+-使用BETWEEN表示独占范围
+-谓词中的数据类型不匹配
+-正确引用标识符
+-使用正确数量的函数参数
+-转换为正确的数据类型
+-使用合适的列进行连接
+如果存在上述任何错误，请重写查询。如果没有错误，只需复制原始查询即可。
+在运行此检查之后，您将调用适当的工具来执行查询。
+        """.format(dialect=db.dialect)
+    system_message = SystemMessage(content=check_query_system_prompt)
+    # 将SQL当作用户消息传入进行检查
+    tool_call = state["messages"][-1].tool_calls[0]
+    # tool_call["args"]["query"] 就能拿到SQL
+    # tool_call: {
+    #     "name": sql_db_query  # 运行sql
+    #     "args": {"query": "select ....."}              # sql
+    #     "id":
+    # }
+    user_message = HumanMessage(content=tool_call["args"]["query"])
+    llm_with_tools = model.bind_tools([run_query_tool], tool_choice="any")
+    response = llm_with_tools.invoke([system_message,user_message])
+    # 带tool_calls的AIMessage
+    # 目前最新的一个消息是AI(t)，现在又生成了一个AI(t)，则可以将两个合成一个
+    response.id = state["messages"][-1].id
+    return {"messages": [response]}
