@@ -1,54 +1,65 @@
-"""LangGraph single-node graph template.
+from typing import Literal
 
-Returns a predefined response. Replace logic and configuration as needed.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Dict
-
+from langgraph.constants import START, END
 from langgraph.graph import StateGraph
-from langgraph.runtime import Runtime
-from typing_extensions import TypedDict
 
+from src.agent.collect import collect_graph
+from src.agent.extend import extend_graph
+from src.agent.recommend import recommended_graph
+from src.agent.common.context import ContextSchema
+from src.agent.node.main import get_store_info, identify_question, get_user_preferences, need_collect
+from src.agent.state.main import State, NeedCollectOutput
 
-class Context(TypedDict):
-    """Context parameters for the agent.
+builder = StateGraph(State,context_schema=ContextSchema)
+builder.add_node(get_store_info)
+builder.add_node(identify_question)
+builder.add_node("recommended_graph", recommended_graph)
+builder.add_node("collect_graph", collect_graph)
+builder.add_node("extend_graph", extend_graph)
+builder.add_node(get_user_preferences)
+builder.add_node(need_collect)
 
-    Set these when creating assistants OR when invoking the graph.
-    See: https://langchain-ai.github.io/langgraph/cloud/how-tos/configuration_cloud/
-    """
+builder.add_edge(START, "get_store_info")
+builder.add_edge("get_store_info", "identify_question")
 
-    my_configurable_param: str
+# 智能路由
+def router_message(state: State) -> Literal["recommended_graph", "collect_graph", "extend_graph", "get_user_preferences"]:
+    user_intent = state["user_intent"]
+    if user_intent == "recommend_blog":
+        return "recommended_graph"
+    elif user_intent == "collect_blog":
+        return "collect_graph"
+    elif user_intent == "get_info":
+        return "get_user_preferences"
+    else:
+        return "extend_graph"
 
-
-@dataclass
-class State:
-    """Input state for the agent.
-
-    Defines the initial structure of incoming data.
-    See: https://langchain-ai.github.io/langgraph/concepts/low_level/#state
-    """
-
-    changeme: str = "example"
-
-
-async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
-    """Process input and returns output.
-
-    Can use runtime context to alter behavior.
-    """
-    return {
-        "changeme": "output from call_model. "
-        f"Configured with {(runtime.context or {}).get('my_configurable_param')}"
-    }
-
-
-# Define the graph
-graph = (
-    StateGraph(State, context_schema=Context)
-    .add_node(call_model)
-    .add_edge("__start__", "call_model")
-    .compile(name="New Graph")
+builder.add_conditional_edges(
+    "identify_question",
+    router_message,
+["recommended_graph", "collect_graph", "extend_graph", "get_user_preferences"]
 )
+
+# 路由1：推荐子图：根据用户中断信息决定后续是否继续收藏
+builder.add_edge("recommended_graph","need_collect")
+def should_collect(state: NeedCollectOutput):
+    collect = state["collect"]
+    if collect == "需要":
+        return "collect_graph"
+    else:
+        return END
+
+builder.add_conditional_edges(
+    "need_collect",
+    should_collect,
+    ["collect_graph",END]
+)
+# 路由2：收藏子图
+builder.add_edge("collect_graph", END)
+
+# 路由3：查询我的
+builder.add_edge("get_user_preferences", END)
+
+# 路由4：其它
+builder.add_edge("extend_graph", END)
+graph = builder.compile()

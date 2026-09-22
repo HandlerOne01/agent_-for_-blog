@@ -1,8 +1,13 @@
 {
   "$schema": "https://langgra.ph/schema.json",
-  "dependencies": ["."],
+  "dependencies": [
+    "."
+  ],
   "graphs": {
-    "agent": "./src/agent/graph.py:graph"
+    "blog_agent": "./src/agent/graph.py:graph",
+    "recommended_agent": "./src/agent/recommend.py:recommended_graph",
+    "collect_agent": "./src/agent/collect.py:collect_graph",
+    "extend_agent": "./src/agent/extend.py:extend_graph"
   },
   "env": ".env",
   "image_distro": "wolfi"

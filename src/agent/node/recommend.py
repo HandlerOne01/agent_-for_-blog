@@ -20,7 +20,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 from structlog.tracebacks import extract
 
-from src.agent.common.context import ContextSchema
+from src.agent.common.context import ContextSchema, get_user_id
 from src.agent.common.llm import model
 from src.agent.common.store import UserPreferences
 from src.agent.state.recommend import RecommendState, get_recommend_info
@@ -71,7 +71,7 @@ def collect_user_info(
     # 场景1：
     # 最新的用户消息： 人工智能 3篇
     # 用户的偏好数据： 字数 1000-2000字
-    user_messages = filter_messages(state["messgaes"], include_type="human")
+    user_messages = filter_messages(state["messages"], include_types=["human"])
     pref = state.get("user_preferences")
     if pref and (pref.get("word_count_min") or pref.get("word_count_max")):
         # 偏好中包含最少和最多字数
@@ -99,8 +99,13 @@ def collect_user_info(
 如果用户提到篇幅范围，请分别提取最少字数和最多字数。
 如果用户提到推荐几篇文章，提取blog_count字段。"""
         )
-        return model.with_structured_output(schema=UserInfo).invoke(
-            [SystemMessage] + messages
+        if not isinstance(messages, list):
+            # extract_messages 可能是单条消息（如用户补充的回答），统一成列表
+            messages = [messages]
+        return model.with_structured_output(
+            schema=UserInfo, method="function_calling"
+        ).invoke(
+            [system_message, *messages]
         )
 
     # 更新状态函数
@@ -115,7 +120,7 @@ def collect_user_info(
     # 根据历史偏好和用户消息提取消息
     updated_state = {}
     extracted_info = extract_info(extract_messages)
-    updated_state = update_state(update_state, extracted_info)
+    updated_state = update_state(updated_state, extracted_info)
 
     # 3. 中断咨询推荐的必须参数
     # 场景2：
@@ -162,7 +167,7 @@ def collect_user_info(
     # 用户的偏好数据：字数 1000-2000字
     if updated_state.get("word_count_min") or updated_state.get("word_count_max"):
         # 有可能会更新
-        user_id = runtime.context.get("user_id")
+        user_id = get_user_id(runtime)
         namespace = (user_id, "preferences")
         prefs_result = store.search(namespace)
         if len(prefs_result) == 0:
@@ -241,7 +246,7 @@ get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
 get_schema_node = ToolNode([get_schema_tool], name="get_schema")
 
 # 节点：执行sql查询
-run_query_tool = next(tool for tool in tools if tool.name == "run_db_query")
+run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
 run_query_node = ToolNode([run_query_tool], name="run_query")
 
 
@@ -255,7 +260,7 @@ def list_tables(state: RecommendState):
         "type": "tool_call",
     }
     # 模拟必定调用工具
-    tool_call_message = AIMessage(content="", tool_call=[tool_call])
+    tool_call_message = AIMessage(content="", tool_calls=[tool_call])
 
     # 2. 手动调用工具：sql_db_list_tables
     list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
@@ -268,7 +273,7 @@ def list_tables(state: RecommendState):
 
 # 节点：绑定工具（获取表信息），让LLM将来必定执行工具节点
 def call_get_schema(state: RecommendState):
-    llm_with_tools = model.bind_tools([get_schema_node], tool_choice="any")
+    llm_with_tools = model.bind_tools([get_schema_tool], tool_choice="any")
     # llm 根据历史消息筛选表，并获取需要的表信息
     response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
