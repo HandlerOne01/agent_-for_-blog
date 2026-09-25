@@ -16,6 +16,11 @@ class RecommendState(MessagesState):
     blog_count: int  # 推荐数量
     others: str  # 其它要求
 
+    # 取数阶段是否已降级（数据库连不上 / 查询失败）。
+    # 由 node/recommend.py 的 _degraded() 置位，用来让图提前收场，
+    # 而不是带着坏数据继续往下走到"答复"节点。
+    recommend_failed: bool
+
 # 获取推荐信息方法
 def get_recommend_info(state: dict) -> str:
     info_prompt = """

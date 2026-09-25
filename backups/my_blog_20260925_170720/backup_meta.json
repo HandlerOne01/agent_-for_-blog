@@ -1,0 +1,223 @@
+{
+  "generated_at": "2026-09-25T17:07:20",
+  "host": "106.52.158.48",
+  "port": 3306,
+  "user": "kiana_mysql",
+  "database": "my_blog",
+  "server": {
+    "v": "8.0.45-0ubuntu0.24.04.1",
+    "cs": "utf8mb4",
+    "coll": "utf8mb4_0900_ai_ci",
+    "sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+    "lctn": 0,
+    "server_now": "2026-09-25 17:07:20"
+  },
+  "objects": {},
+  "row_counts": {
+    "blog": {
+      "db_count": 12,
+      "json_rows": 12,
+      "sql_inserts": 12,
+      "columns": [
+        "id",
+        "topic",
+        "category",
+        "blog_type",
+        "tags",
+        "word_count",
+        "has_code",
+        "difficulty",
+        "title",
+        "author",
+        "intro",
+        "blog_url",
+        "publish_date",
+        "view_count",
+        "status"
+      ],
+      "json_file": "data_blog.json",
+      "json_bytes": 6263,
+      "json_sha256": "abb077b02fad043627f1a8d6e6496267df4da1a7d7b202a8d9768b12e376dda0"
+    },
+    "blog_content": {
+      "db_count": 1,
+      "json_rows": 1,
+      "sql_inserts": 1,
+      "columns": [
+        "blog_id",
+        "content",
+        "content_fmt",
+        "toc",
+        "code_lang",
+        "content_hash",
+        "updated_at"
+      ],
+      "json_file": "data_blog_content.json",
+      "json_bytes": 611,
+      "json_sha256": "d38f2a7a204e2be254c9ef5ca37875ac1e7d9251507ec1a44515777582bd15f9"
+    }
+  },
+  "files": [
+    {
+      "path": "data.sql",
+      "bytes": 7141,
+      "sha256": "2c622d0d8cd169f6b2b2ee2a16d867b095917b645b1c1cd537661ff11f3c7106"
+    },
+    {
+      "path": "data_blog.json",
+      "bytes": 6263,
+      "sha256": "abb077b02fad043627f1a8d6e6496267df4da1a7d7b202a8d9768b12e376dda0"
+    },
+    {
+      "path": "data_blog_content.json",
+      "bytes": 611,
+      "sha256": "d38f2a7a204e2be254c9ef5ca37875ac1e7d9251507ec1a44515777582bd15f9"
+    },
+    {
+      "path": "langgraph_api/.langgraph_checkpoint.1.pckl",
+      "bytes": 276828,
+      "sha256": "8dc8d8054e0a48f0fb9da2f79af903d28de533e0addc36cf5fd759c0094d2cd7"
+    },
+    {
+      "path": "langgraph_api/.langgraph_checkpoint.2.pckl",
+      "bytes": 127244,
+      "sha256": "b4b4d4e0f756cd648291bfcf7850fc218c0fb0632c32f7d782e5c2e95a7dd9a4"
+    },
+    {
+      "path": "langgraph_api/.langgraph_checkpoint.3.pckl",
+      "bytes": 752576,
+      "sha256": "dbb7280cdbc2fc999d4f9f1f6e1c90dc3a2c030913a815bc64263424cda54daf"
+    },
+    {
+      "path": "langgraph_api/.langgraph_ops.pckl",
+      "bytes": 165904,
+      "sha256": "25dcbfa9ab15bfe5d4cddf47b12bdf344fb002534ed5b36450e571fb1808a2fc"
+    },
+    {
+      "path": "langgraph_api/.langgraph_retry_counter.pckl",
+      "bytes": 6,
+      "sha256": "ad2598304a8af697d0c335a50a3e5a1ba06c82d9b63ef5f9d3e730b54cf9148a"
+    },
+    {
+      "path": "langgraph_api/store.pckl",
+      "bytes": 1614,
+      "sha256": "4405a671374648598ca75aeafb7d49704b21b5f5b4334534e8f73324f3f8d63c"
+    },
+    {
+      "path": "langgraph_api/store.vectors.pckl",
+      "bytes": 6,
+      "sha256": "ad2598304a8af697d0c335a50a3e5a1ba06c82d9b63ef5f9d3e730b54cf9148a"
+    },
+    {
+      "path": "schema.json",
+      "bytes": 21124,
+      "sha256": "c3fe17d0030d894bfbff7d968e8706ed87fb753f7521c00d38a3c12dc9762ceb"
+    },
+    {
+      "path": "schema.sql",
+      "bytes": 4212,
+      "sha256": "84ff71f4294cde958287e50f1c12302af1c8164deb7e7813d5976cb3325300c9"
+    }
+  ],
+  "langgraph": {
+    "source": "D:\\HuaweiMoveData\\Users\\HUAWEI\\Desktop\\agent_-for_-blog\\.langgraph_api",
+    "dest": "D:\\HuaweiMoveData\\Users\\HUAWEI\\Desktop\\agent_-for_-blog\\backups\\my_blog_20260925_170720\\langgraph_api",
+    "file_count": 7,
+    "bytes": 1324178,
+    "files": [
+      {
+        "path": "langgraph_api/.langgraph_checkpoint.1.pckl",
+        "bytes": 276828,
+        "sha256": "8dc8d8054e0a48f0fb9da2f79af903d28de533e0addc36cf5fd759c0094d2cd7"
+      },
+      {
+        "path": "langgraph_api/.langgraph_checkpoint.2.pckl",
+        "bytes": 127244,
+        "sha256": "b4b4d4e0f756cd648291bfcf7850fc218c0fb0632c32f7d782e5c2e95a7dd9a4"
+      },
+      {
+        "path": "langgraph_api/.langgraph_checkpoint.3.pckl",
+        "bytes": 752576,
+        "sha256": "dbb7280cdbc2fc999d4f9f1f6e1c90dc3a2c030913a815bc64263424cda54daf"
+      },
+      {
+        "path": "langgraph_api/.langgraph_ops.pckl",
+        "bytes": 165904,
+        "sha256": "25dcbfa9ab15bfe5d4cddf47b12bdf344fb002534ed5b36450e571fb1808a2fc"
+      },
+      {
+        "path": "langgraph_api/.langgraph_retry_counter.pckl",
+        "bytes": 6,
+        "sha256": "ad2598304a8af697d0c335a50a3e5a1ba06c82d9b63ef5f9d3e730b54cf9148a"
+      },
+      {
+        "path": "langgraph_api/store.pckl",
+        "bytes": 1614,
+        "sha256": "4405a671374648598ca75aeafb7d49704b21b5f5b4334534e8f73324f3f8d63c"
+      },
+      {
+        "path": "langgraph_api/store.vectors.pckl",
+        "bytes": 6,
+        "sha256": "ad2598304a8af697d0c335a50a3e5a1ba06c82d9b63ef5f9d3e730b54cf9148a"
+      }
+    ]
+  },
+  "warnings": [
+    "DEFINER clause stripped from view(s): v_blog"
+  ],
+  "schema_selfcheck": {
+    "statements": 14,
+    "statement_shapes": {
+      "SET": 7,
+      "DROP": 3,
+      "CREATE": 3,
+      "ALTER": 1
+    },
+    "deferred_fk_alters": 1,
+    "inline_fk_remaining": 0,
+    "fks_from_information_schema": 1,
+    "fks_moved_out_of_create_table": [
+      {
+        "table": "blog_content",
+        "clause": "CONSTRAINT `fk_content_blog` FOREIGN KEY (`blog_id`) REFERENCES `blog` (`id`) ON DELETE CASCADE"
+      }
+    ],
+    "parsed_vs_catalog": {
+      "blog": {
+        "columns_match": true,
+        "column_count": 15,
+        "primary_key_match": true,
+        "primary_key": [
+          "id"
+        ],
+        "indexes_parsed": [
+          "idx_publish",
+          "idx_topic_hot",
+          "idx_topic_word"
+        ],
+        "indexes_missing": [],
+        "indexes_match": true,
+        "fulltext_preserved": true,
+        "inline_fk_in_ddl": []
+      },
+      "blog_content": {
+        "columns_match": true,
+        "column_count": 7,
+        "primary_key_match": true,
+        "primary_key": [
+          "blog_id"
+        ],
+        "indexes_parsed": [
+          "ft_content"
+        ],
+        "indexes_missing": [],
+        "indexes_match": true,
+        "fulltext_preserved": true,
+        "inline_fk_in_ddl": []
+      }
+    }
+  },
+  "total_bytes": 1363529,
+  "backup_dir": "D:\\HuaweiMoveData\\Users\\HUAWEI\\Desktop\\agent_-for_-blog\\backups\\my_blog_20260925_170720",
+  "finished_at": "2026-09-25T17:07:21"
+}

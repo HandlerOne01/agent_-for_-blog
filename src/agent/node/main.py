@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 
 from src.agent.common.context import ContextSchema, get_user_id
-from src.agent.common.llm import model
+from src.agent.common.llm import model, model_deterministic
 from src.agent.common.persona import with_persona
 from src.agent.state.main import State, NeedCollectOutput
 
@@ -36,7 +36,8 @@ def identify_question(state: State):
     # state["messages"] # 用户问题  -》 LLM  -> 结构化输出（type） : 推荐、收藏、我的、其它
     # DeepSeek 不支持 response_format={"type": "json_schema"}（会返回
     # "This response_format type is unavailable now"），必须显式走 tool-calling。
-    user_intent = model.with_structured_output(
+    # 路由要的是稳定，不是文采 —— 用低温度的那个模型。
+    user_intent = model_deterministic.with_structured_output(
         UserMessage, method="function_calling"
     ).invoke(
         [
@@ -52,9 +53,12 @@ def identify_question(state: State):
 
 # 节点：中断询问是否需要帮助收藏博客文章
 def need_collect(state: State) -> NeedCollectOutput:
-    prompt = f"已经为您推荐合适的博客文章，是否需要帮您收藏文章？\n"
-    prompt += "如果不需要,请输入'**不需要**'。\n"
-    prompt += "如果需要,请输入'**需要**'。\n(注意输入其它值无效)\n"
+    # 中断文案用爱弥斯口吻：不用「您」，不是客服话术。
+    # 「需要 / 不需要」这两个约定词必须原样保留 ——
+    # graph.py 的 should_collect 就是靠 collect == "需要" 判断要不要进收藏子图。
+    prompt = "给你放了几篇在下面。要不要我收进本子？\n"
+    prompt += "要收就回我「需要」，不用就回「不需要」。\n"
+    prompt += "（这两个词我认得准；回别的话，我这边就当你没说。）"
     answer = interrupt(prompt)
     return {"collect": answer}  # 条件边获取到后，是否执行收藏子图
 

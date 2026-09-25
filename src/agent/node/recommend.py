@@ -1,4 +1,6 @@
+import ast
 import os
+import re
 import uuid
 from typing import Optional
 
@@ -9,8 +11,10 @@ from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import (
     filter_messages,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     AIMessage,
+    ToolMessage,
 )
 from langchain_core.messages.tool import tool_call
 from langgraph.prebuilt import ToolNode
@@ -21,7 +25,8 @@ from pydantic import BaseModel, Field
 from structlog.tracebacks import extract
 
 from src.agent.common.context import ContextSchema, get_user_id
-from src.agent.common.llm import model
+from src.agent.common.llm import model, model_deterministic
+from src.agent.common.persona import with_persona
 from src.agent.common.store import UserPreferences
 from src.agent.state.recommend import RecommendState, get_recommend_info
 
@@ -102,7 +107,7 @@ def collect_user_info(
         if not isinstance(messages, list):
             # extract_messages 可能是单条消息（如用户补充的回答），统一成列表
             messages = [messages]
-        return model.with_structured_output(
+        return model_deterministic.with_structured_output(
             schema=UserInfo, method="function_calling"
         ).invoke(
             [system_message, *messages]
@@ -130,17 +135,20 @@ def collect_user_info(
     # 检查是否缺失关键信息: 领域、字数范围
     missing_info = []
     if not updated_state.get("topic"):
-        missing_info.append("**领域/分类**")
+        missing_info.append("方向（想看哪一块）")
     if (
         updated_state.get("word_count_min") is None
         or updated_state.get("word_count_max") is None
     ):
-        missing_info.append("**字数范围**")
+        missing_info.append("篇幅（大概多少字、能看多久）")
 
     if missing_info:
-        prompt = f"为了给您推荐合适的博客文章，请提供以下信息:{'，'.join(missing_info)}和其它信息。\n"
+        # 中断文案用爱弥斯口吻：不用「您」，不是客服话术。
+        # 「不提供」这个约定词必须原样保留 —— 下面就是靠它判断用户是否放弃补充。
+        prompt = f"行，我去翻。不过你还没说清：{'；'.join(missing_info)}。\n"
         prompt += (
-            "如果您不想提供，请输入'**不提供**',我会根据已有信息为您推荐博客文章。"
+            "不想说也行，回我「不提供」——我按站里的常用范围替你挑，"
+            "挑完你再嫌。"
         )
         # 根据缺失的信息进行中断
         answer = interrupt(prompt)
@@ -226,45 +234,142 @@ def collect_user_info(
     return updated_state
 
 
-# 使用.env环境变量(win)
-load_dotenv()
-db_user = os.getenv("DB_USER")
-db_password = os.getenv("DB_PASSWORD")
-db_host = os.getenv("DB_HOST")
-db_port = os.getenv("DB_PORT")
-db_name = os.getenv("DB_NAME")
-db = SQLDatabase.from_uri(
-    f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+# ============================================================================
+# 数据库：懒加载 + 失败降级
+# ----------------------------------------------------------------------------
+# 为什么改：这里原来在【导入期】就执行 SQLDatabase.from_uri(...)。
+# langchain 的 SQLDatabase.__init__ 会 inspect(self._engine)，也就是**当场握手**
+# （见 langchain_community/utilities/sql_database.py:106）。
+# 于是数据库抖一下、或库名写错，import 就抛 OperationalError ——
+# langgraph 连图都建不起来，连「在吗」这种纯闲聊也一起挂。
+# 取数只是推荐路径里的一步，不该有拖垮全部能力的话语权。
+# 现在：第一次真正要用时才连；连不上抛 DBUnavailable，
+# 由各节点接住并降级成一句人设化的提示（见 persona.txt 5.1）。
+#
+# 库名走 DB_NAME 环境变量，所以可以临时指向影子库/不存在的库做验证。
+# ============================================================================
+
+# 数据库不可用时，代替推荐结果说的话（爱弥斯口吻，不用「您」）。
+DB_UNAVAILABLE_REPLY = (
+    "我连不上放文章的那个地方了。这会儿找不了文章，聊天还行——"
+    "你要不要先随便问我点别的？"
 )
 
-# 获取数据库工具
-toolkit = SQLDatabaseToolkit(db=db, llm=model)
-tools = toolkit.get_tools()
+# 推荐答复只认这五列，且顺序固定 —— 与 generate_query 里的取数列约定一致。
+RECO_COLUMNS = ("title", "category", "word_count", "difficulty", "blog_url")
 
-# 节点：获取表信息
-get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
-get_schema_node = ToolNode([get_schema_tool], name="get_schema")
-
-# 节点：执行sql查询
-run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
-run_query_node = ToolNode([run_query_tool], name="run_query")
+# 站内文章总数，是个事实常量；它不算「本轮结果集的条数」。
+LIB_TOTAL = 133
 
 
-# 节点：获取全量表
-def list_tables(state: RecommendState):
-    # 1. 获取AIMessage(tool_calls)
-    tool_call = {
-        "name": "sql_db_list_tables",
-        "args": {},
-        "id": "123123",
-        "type": "tool_call",
+class DBUnavailable(RuntimeError):
+    """数据库连不上。用于让节点降级，而不是让整张图炸掉。"""
+
+
+def _db_uri() -> str:
+    """按环境变量拼连接串。库名可被 DB_NAME 覆盖（便于指向影子库做验证）。"""
+    return (
+        f"mysql+pymysql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
+        f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+    )
+
+
+def _safe_err(exc: BaseException) -> str:
+    """异常文本里可能带着含密码的连接串。落日志之前先把密码抹掉。"""
+    msg = f"{type(exc).__name__}: {exc}"
+    secret = os.getenv("DB_PASSWORD")
+    if secret:
+        msg = msg.replace(secret, "***")
+    return msg
+
+
+_db_singleton: Optional[SQLDatabase] = None
+_tools_singleton: Optional[list] = None
+_tool_node_singleton: dict = {}
+
+
+def get_db() -> SQLDatabase:
+    """首次调用时才真正连库；连不上抛 DBUnavailable。"""
+    global _db_singleton
+    if _db_singleton is None:
+        try:
+            _db_singleton = SQLDatabase.from_uri(_db_uri())
+        except Exception as exc:  # noqa: BLE001 任何连接/握手问题都走同一条降级路径
+            _db_singleton = None
+            raise DBUnavailable(_safe_err(exc)) from exc
+    return _db_singleton
+
+
+def get_sql_tools() -> list:
+    """SQL 工具集，同样懒加载。"""
+    global _tools_singleton
+    if _tools_singleton is None:
+        _tools_singleton = SQLDatabaseToolkit(db=get_db(), llm=model).get_tools()
+    return _tools_singleton
+
+
+def _tool(name: str):
+    return next(tool for tool in get_sql_tools() if tool.name == name)
+
+
+def _tool_node(cache_key: str, tool_name: str) -> ToolNode:
+    """ToolNode 也懒建 —— 它的构造要拿到已经连上的 db。
+
+    handle_tool_errors=False：让取数失败抛出来，交给下面的包装函数降级。
+    默认值会把异常吞成一条 ToolMessage，图会带着坏数据继续往下走。
+    """
+    if cache_key not in _tool_node_singleton:
+        _tool_node_singleton[cache_key] = ToolNode(
+            [_tool(tool_name)], name=cache_key, handle_tool_errors=False
+        )
+    return _tool_node_singleton[cache_key]
+
+
+def _degraded() -> dict:
+    """统一的降级返回：一句人设化提示 + 一个给路由看的失败标记。"""
+    return {
+        "messages": [AIMessage(content=DB_UNAVAILABLE_REPLY)],
+        "recommend_failed": True,
     }
-    # 模拟必定调用工具
-    tool_call_message = AIMessage(content="", tool_calls=[tool_call])
 
-    # 2. 手动调用工具：sql_db_list_tables
-    list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
-    tool_message = list_tables_tool.invoke(tool_call)
+
+# 节点：获取表信息（ToolNode 的降级包装）
+def get_schema_node(state: RecommendState):
+    try:
+        return _tool_node("get_schema", "sql_db_schema").invoke(state)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 取表结构失败，降级：{_safe_err(exc)}")
+        return _degraded()
+
+
+# 节点：执行sql查询（ToolNode 的降级包装）
+def run_query_node(state: RecommendState):
+    try:
+        return _tool_node("run_query", "sql_db_query").invoke(state)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 执行查询失败，降级：{_safe_err(exc)}")
+        return _degraded()
+
+
+# 节点：获取全量表（连不上库就降级，让图能收场而不是抛异常）
+def list_tables(state: RecommendState):
+    try:
+        # 1. 获取AIMessage(tool_calls)
+        tool_call = {
+            "name": "sql_db_list_tables",
+            "args": {},
+            "id": "123123",
+            "type": "tool_call",
+        }
+        # 模拟必定调用工具
+        tool_call_message = AIMessage(content="", tool_calls=[tool_call])
+
+        # 2. 手动调用工具：sql_db_list_tables
+        list_tables_tool = _tool("sql_db_list_tables")
+        tool_message = list_tables_tool.invoke(tool_call)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 列表面失败，降级：{_safe_err(exc)}")
+        return _degraded()
 
     # 整合结果
     response = AIMessage(content=f"可用的表:{tool_message.content}")
@@ -273,27 +378,55 @@ def list_tables(state: RecommendState):
 
 # 节点：绑定工具（获取表信息），让LLM将来必定执行工具节点
 def call_get_schema(state: RecommendState):
+    try:
+        get_schema_tool = _tool("sql_db_schema")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 取表结构工具不可用，降级：{_safe_err(exc)}")
+        return _degraded()
     llm_with_tools = model.bind_tools([get_schema_tool], tool_choice="any")
     # llm 根据历史消息筛选表，并获取需要的表信息
     response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
 
 
-# 节点：生成SQL + 整合结果
+# 节点：生成SQL
+# 注意：这个节点**只负责取数**，不负责「说给用户听」。
+# 答复由 compose_answer 用人设重新组织 —— 见下面的说明。
 def generate_query(state: RecommendState):
     generate_query_system_prompt = """
-    您是一个设计用于与SQL数据库交互的代理。
-    给定一个输入问题，创建一个语法正确的{dialect}查询来运行，然后查看查询的结果并返回答案。
+    你是一个只负责取数的 SQL 代理。
+    给定一个输入问题，创建一个语法正确的{dialect}查询来运行。
     需要根据rows from table的示例设置真实查询的值。
     除非用户指定了他们希望获得的特定数量的示例，否则始终将查询限制为最多{top_k}个结果。
-    您可以按相关列对结果排序，以返回最感兴趣的结果。不要查询特定表中的所有列，只查询给定问题的相关列。
+    你可以按相关列对结果排序，以返回最感兴趣的结果。不要查询特定表中的所有列，只查询给定问题的相关列。
     不要对数据库做任何DML语句（INSERT， UPDATE， DELETE， DROP等)。
+
+    【取数列约定（必须严格遵守）】
+    查询 blog 表时，SELECT 列表必须恰好是下面这五列，顺序也不能变：
+        title, category, word_count, difficulty, blog_url
+    不要加 id、intro、tags 等其它列 —— 下游要靠列顺序解析结果。
+
+    【查不到就空着，绝对不要擅自放宽】
+    如果按用户给出的主题 / 关键词筛选之后一行都没有，就让它空着。
+    不要把 WHERE 里的主题条件删掉、换一批不相干的文章顶上。
+    「这个方向现在没有」是一个合格答案，后面的节点会如实告诉用户；
+    用不相干的文章冒充结果，才是这里最严重的错误。
+    用户明确给出的主题词，在整轮查询里都不许丢。
+
+    【重要】你不要替用户组织语言、不要写推荐语、不要解释结果。
+    取完数就收手（不再调用工具），由后面的节点把结果说给用户听。
             """
+    try:
+        dialect = get_db().dialect
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 生成查询前连库失败，降级：{_safe_err(exc)}")
+        return _degraded()
     system_prompt = generate_query_system_prompt.format(
-        dialect=db.dialect, top_k=state.get("blog_count", 5)
+        dialect=dialect, top_k=state.get("blog_count", 5)
     )
     system_message = SystemMessage(content=system_prompt)
-    llm_with_tools = model.bind_tools([run_query_tool])
+    # 取数要的是稳定，不是文采 —— 固定用低温度的那个模型。
+    llm_with_tools = model_deterministic.bind_tools([_tool("sql_db_query")])
     return {"messages": [llm_with_tools.invoke([system_message] + state["messages"])]}
 
     # QuerySQLDatabaseTool
@@ -317,9 +450,10 @@ def check_query(state: RecommendState):
 -使用正确数量的函数参数
 -转换为正确的数据类型
 -使用合适的列进行连接
+另外必须保留 SELECT 的五列约定：title, category, word_count, difficulty, blog_url（顺序不变）。
 如果存在上述任何错误，请重写查询。如果没有错误，只需复制原始查询即可。
 在运行此检查之后，您将调用适当的工具来执行查询。
-        """.format(dialect=db.dialect)
+        """.format(dialect=get_db().dialect)
     system_message = SystemMessage(content=check_query_system_prompt)
     # 将SQL当作用户消息传入进行检查
     tool_call = state["messages"][-1].tool_calls[0]
@@ -330,9 +464,337 @@ def check_query(state: RecommendState):
     #     "id":
     # }
     user_message = HumanMessage(content=tool_call["args"]["query"])
-    llm_with_tools = model.bind_tools([run_query_tool], tool_choice="any")
+    llm_with_tools = model_deterministic.bind_tools(
+        [_tool("sql_db_query")], tool_choice="any"
+    )
     response = llm_with_tools.invoke([system_message,user_message])
     # 带tool_calls的AIMessage
     # 目前最新的一个消息是AI(t)，现在又生成了一个AI(t)，则可以将两个合成一个
     response.id = state["messages"][-1].id
     return {"messages": [response]}
+
+
+# ============================================================================
+# 节点：把人设 + 查询结果说成爱弥斯的话
+# ----------------------------------------------------------------------------
+# 为什么要有这个节点：在它之前，用户看到的推荐是 generate_query 直接产出的 ——
+# 那句系统提示词写的是「你是一个与 SQL 数据库交互的代理」，于是答复必然是
+# 客服腔，没有半点爱弥斯。SQL 应该只取数；说话是这里的事。
+#
+# 硬约束（这个节点存在的全部理由）：
+#   1. 篇数 / 标题 / 链接**逐字来自查询结果**，一个字都不许自己编；
+#   2. 链接只给站内相对路径 /posts/.../ —— 库里存的是带域名的完整 URL，
+#      这里必须把域名剥掉；
+#   3. 不许 markdown 表格、不许加粗、不许出现「您」；
+#   4. 说「共 N 篇」就必须**正好列 N 条**，校验不过就退到模板兜底。
+#      上一轮实测的 bug 就是「说 4 篇、列了 5 行，还编了个理由」，所以必须校验。
+# ============================================================================
+
+_URL_RE = re.compile(r"/posts/[A-Za-z0-9_\-./]*")
+_COUNT_RE = re.compile(r"(\d+)\s*篇")
+
+
+def _to_relative(url) -> str:
+    """库里存的是 https://<域名>/posts/.../ ，气泡里只能给站内相对路径。"""
+    if not url:
+        return ""
+    path = re.sub(r"^https?://[^/]+", "", str(url).strip())
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _parse_rows(raw) -> Optional[list]:
+    """把 SQL 工具返回的原始文本解析成行字典；解析不了返回 None（不猜）。
+
+    注意空串：SQLDatabase.run 在「语句合法但零行」时返回的是空字符串。
+    那代表**查到了，只是没有匹配**，不是「连不上」，更不是「解析失败」——
+    这两种结果对用户说的话完全不一样，不能混。
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text == "":
+        return []
+    if not text.startswith("["):
+        return None
+    try:
+        data = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return None
+    if not isinstance(data, (list, tuple)):
+        return None
+    rows = []
+    for item in data:
+        if isinstance(item, dict):
+            rows.append(item)
+        elif isinstance(item, (list, tuple)):
+            rows.append(dict(zip(RECO_COLUMNS, item)))
+        else:
+            return None
+    return rows
+
+
+def _collect_posts(state: RecommendState) -> Optional[list]:
+    """取最后一次 SQL 查询的结果，规整成文章列表。
+
+    返回 None = 没拿到可解析的查询结果；返回 [] = 拿到了但一条都不匹配。
+    这两种情况必须分开说 —— 前者不能说成「站里没有」。
+    """
+    tool_msgs = filter_messages(state["messages"], include_types=["tool"])
+    if not tool_msgs:
+        return None
+    rows = _parse_rows(tool_msgs[-1].content)
+    if rows is None:
+        return None
+    posts = []
+    for row in rows:
+        title = row.get("title")
+        url = _to_relative(row.get("blog_url"))
+        if not title or not url:
+            continue
+        posts.append(
+            {
+                "title": str(title),
+                "category": str(row.get("category") or ""),
+                "word_count": row.get("word_count"),
+                "difficulty": row.get("difficulty"),
+                "blog_url": url,
+            }
+        )
+    return posts
+
+
+def _validate(rendered: str, posts: list) -> list:
+    """校验答复。返回问题清单，空列表 = 通过。"""
+    problems = []
+    if re.search(r"^\s*\|.*\|\s*$", rendered, re.M):
+        problems.append("出现了 markdown 表格")
+    if "**" in rendered:
+        problems.append("出现了加粗星号")
+    if re.search(r"^\s*#{1,6}\s", rendered, re.M):
+        problems.append("出现了 markdown 标题")
+    if re.search(r"https?://", rendered, re.I):
+        problems.append("出现了带域名的链接")
+    if "您" in rendered:
+        problems.append("出现了「您」")
+    if re.search(r"\[[^\]]+\]\([^)]+\)", rendered):
+        problems.append("出现了 markdown 链接语法")
+
+    allowed = [post["blog_url"] for post in posts]
+    used = []
+    for url in _URL_RE.findall(rendered):
+        url = url.rstrip("）)。,，、")
+        if url and url not in used:
+            used.append(url)
+    for url in used:
+        if url not in allowed:
+            problems.append(f"链接不在查询结果里: {url}")
+    if not used:
+        problems.append("一条链接都没给")
+
+    # 每篇都必须标题 + 链接成对出现（防止标题和链接错配、或漏掉某条）
+    for post in posts:
+        if post["title"] not in rendered:
+            problems.append(f"漏了标题: {post['title']}")
+        elif post["blog_url"] not in rendered:
+            problems.append(f"漏了链接: {post['blog_url']}")
+
+    if len(used) != len(posts):
+        problems.append(f"列了 {len(used)} 条，查询结果是 {len(posts)} 条")
+
+    # 「N 篇」必须等于实际列出的条数（133 是站内总数常量，不算本轮计数）
+    for match in _COUNT_RE.finditer(rendered):
+        n = int(match.group(1))
+        if n == LIB_TOTAL:
+            continue
+        if n != len(posts):
+            problems.append(f"说「{n} 篇」但查询结果是 {len(posts)} 条")
+            break
+    return problems
+
+
+def _template_reply(posts: list) -> str:
+    """兜底模板：不经过 LLM，所以篇数 / 标题 / 链接一定是对的。"""
+    lines = [f"给你翻到 {len(posts)} 篇，就这几篇："]
+    for post in posts:
+        bits = [f"《{post['title']}》"]
+        if post["category"]:
+            bits.append(post["category"])
+        if post["word_count"]:
+            bits.append(f"约 {post['word_count']} 字")
+        lines.append(" · ".join(bits))
+        lines.append(post["blog_url"])
+    return "\n".join(lines)
+
+
+def _noisy_sql_summary(state: RecommendState):
+    """找到 SQL 代理自己写的那句总结 —— 我们要把它从消息流里删掉。
+
+    位置：最后一条 tool 消息之后，第一条「有正文、没有 tool_calls」的 AIMessage。
+    它长的样子是「已取数完成」或者一张 markdown 表格 —— SQL 只该取数，
+    这些打字不该出现在用户眼前（表格更是人设明令禁止的）。
+    没有就返回 None，不要硬找。
+    """
+    messages = state["messages"]
+    last_tool_idx = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, ToolMessage):
+            last_tool_idx = i
+    for msg in messages[last_tool_idx + 1:]:
+        if (
+            isinstance(msg, AIMessage)
+            and not msg.tool_calls
+            and str(msg.content or "").strip()
+        ):
+            return msg
+    return None
+
+
+def _reply(state: RecommendState, text: str) -> dict:
+    """统一出口：先删掉 SQL 代理的总结，再放上爱弥斯说的话。"""
+    outgoing: list = []
+    noisy = _noisy_sql_summary(state)
+    if noisy is not None and getattr(noisy, "id", None):
+        outgoing.append(RemoveMessage(id=noisy.id))
+    outgoing.append(AIMessage(content=text))
+    return {"messages": outgoing}
+
+
+_EMPTY_TASK = (
+    "这一轮你做的是「库里没有」：检索结果是 0 条，站里确实没有他要的那个方向。\n"
+    "用你自己的口气把这件事告诉他。要求：\n"
+    "- 直说没有。不含糊，不道歉，也不要解释成「我找不到」。\n"
+    "- 一条文章都不许提：**不许出现任何标题（《》）**，**不许出现任何链接（/posts/）**。\n"
+    "- 不许说「我记得好像有一篇」这种话。\n"
+    "- 2~3 句。最后给一个替代方向（换个说法 / 放宽条件 / 站里相近的主题）。\n"
+    "- 不要 markdown，不要加粗，不要用「您」。"
+)
+
+# 兜底：不经过 LLM，所以绝不可能编出标题或链接。
+_FALLBACK_EMPTY = (
+    f"没有诶。{LIB_TOTAL} 篇我全翻了一遍，这个方向一条都没有。\n"
+    "这个我不编——编了你更亏。\n"
+    "……换个说法？或者把范围放宽一点，我再翻一遍。"
+)
+
+
+def _empty_reply() -> str:
+    """空结果也要说人话：走人设，但用校验把「编造」这条路彻底堵死。
+
+    空结果是最容易出事的地方（模型很想"给点什么"），所以宁可退模板：
+    只要回答里冒出标题、链接、markdown 或「您」，一律丢弃。
+    """
+    text = ""
+    try:
+        response = model.invoke(
+            [
+                SystemMessage(content=with_persona(_EMPTY_TASK)),
+                HumanMessage(content="检索结果：0 条。"),
+            ]
+        )
+        text = (
+            response.content
+            if isinstance(response.content, str)
+            else str(response.content)
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 空结果答复生成失败，退模板：{_safe_err(exc)}")
+
+    problems = []
+    if not text.strip():
+        problems.append("空回复")
+    if "/posts/" in text:
+        problems.append("出现了链接")
+    if "《" in text or "》" in text:
+        problems.append("出现了文章标题")
+    if "您" in text:
+        problems.append("出现了「您」")
+    if "**" in text or re.search(r"^\s*\|.*\|\s*$", text, re.M):
+        problems.append("出现了 markdown")
+    if problems:
+        print(f"[recommend] 空结果答复未通过校验，退模板：{problems}")
+        return _FALLBACK_EMPTY
+    return text
+
+
+def compose_answer(state: RecommendState):
+    """节点：只负责「说话」——把人设 + 查询结果说成爱弥斯的话。"""
+    if state.get("recommend_failed"):
+        return _reply(state, DB_UNAVAILABLE_REPLY)
+
+    tool_msgs = filter_messages(state["messages"], include_types=["tool"])
+    if not tool_msgs:
+        # 没走到取数就收手了 —— 不许编，如实说，并留一个接口。
+        return _reply(
+            state,
+            "我还没拿到结果就停住了。你再问我一次，"
+            "或者把方向说具体一点——比如「讲 Linux 进程的，短一点的」。",
+        )
+
+    rows = _parse_rows(tool_msgs[-1].content)
+    posts = _collect_posts(state)
+
+    if rows is None or posts is None:
+        # 结果解析不了 —— 别假装「133 篇里没有」，那是另一回事。
+        return _reply(state, DB_UNAVAILABLE_REPLY)
+
+    if not rows:
+        # 空结果也走人设，但用 _empty_reply 的校验兜住"编造"
+        return _reply(state, _empty_reply())
+
+    if not posts:
+        return _reply(
+            state,
+            "查到了一些条目，但没取到链接。我不敢凭标题给你拼路径——"
+            "你稍后再问我一次。",
+        )
+
+    data_block = "\n".join(
+        "{i}. 标题={t} | 分类={c} | 字数={w} | 难度={d} | 链接={u}".format(
+            i=i,
+            t=post["title"],
+            c=post["category"] or "未标",
+            w=post["word_count"],
+            d=post["difficulty"],
+            u=post["blog_url"],
+        )
+        for i, post in enumerate(posts, 1)
+    )
+    task = (
+        "这一轮你做的是「推荐文章」。下面是检索结果，共 {n} 条，"
+        "每一条都必须出现在你的回答里：\n{data}\n\n"
+        "怎么写：\n"
+        "- 先用一句你自己的话起头，不要「以下是推荐结果」这种腔。\n"
+        "- 然后按上面的顺序逐条写：一行《标题》· 分类 · 约 X 字，"
+        "下一行给链接（就用上面给的链接，原样复制，它已经是不带域名的站内路径）。\n"
+        "- 每条可以补一句你自己的判断：这篇适合谁、要不要留出时间。\n"
+        "- 说「{n} 篇」就必须正好 {n} 条，不许增、不许减、不许编。\n"
+        "- 不要 markdown 表格，不要加粗，不要写域名，不要用「您」。\n"
+        "- 不要在回答里提站内文章总数，只讲这一轮的 {n} 条。\n"
+        "- 长度：引子一句 + 条目 + 收尾一句，别写成一篇文章。"
+    ).format(n=len(posts), data=data_block)
+
+    rendered = ""
+    try:
+        response = model.invoke(
+            [
+                SystemMessage(content=with_persona(task)),
+                HumanMessage(content="上面是这一轮的检索结果。按规则说给他听。"),
+            ]
+        )
+        rendered = (
+            response.content
+            if isinstance(response.content, str)
+            else str(response.content)
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[recommend] 人设化答复生成失败，退模板：{_safe_err(exc)}")
+
+    problems = _validate(rendered, posts)
+    if problems:
+        # 校验不过就退模板：宁可少一点人味，也不能给出错的篇数 / 标题 / 链接。
+        print(f"[recommend] 人设化答复未通过校验，退模板：{problems}")
+        rendered = _template_reply(posts)
+
+    return _reply(state, rendered)

@@ -41,7 +41,22 @@ builder.add_conditional_edges(
 )
 
 # 路由1：推荐子图：根据用户中断信息决定后续是否继续收藏
-builder.add_edge("recommended_graph","need_collect")
+def after_recommend(state: State) -> Literal["need_collect", "__end__"]:
+    """推荐子图跑完后的去向。
+
+    取数降级（数据库连不上）时，子图一条文章都没给出，
+    这时候再问「要不要把文章收进本子」就是自说自话 —— 直接收场。
+    """
+    if state.get("recommend_failed"):
+        return END
+    return "need_collect"
+
+
+builder.add_conditional_edges(
+    "recommended_graph",
+    after_recommend,
+    ["need_collect", END],
+)
 def should_collect(state: NeedCollectOutput):
     collect = state["collect"]
     if collect == "需要":

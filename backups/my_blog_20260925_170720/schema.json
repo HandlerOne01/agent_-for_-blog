@@ -1,0 +1,760 @@
+{
+  "database": "my_blog",
+  "generated_at": "2026-09-25T17:07:20",
+  "server": {
+    "v": "8.0.45-0ubuntu0.24.04.1",
+    "cs": "utf8mb4",
+    "coll": "utf8mb4_0900_ai_ci",
+    "sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+    "lctn": 0,
+    "server_now": "2026-09-25 17:07:20"
+  },
+  "tables": {
+    "blog": {
+      "kind": "BASE TABLE",
+      "table_meta": {
+        "TABLE_NAME": "blog",
+        "TABLE_TYPE": "BASE TABLE",
+        "ENGINE": "InnoDB",
+        "TABLE_COLLATION": "utf8mb4_0900_ai_ci",
+        "TABLE_ROWS": 12,
+        "DATA_LENGTH": 16384,
+        "INDEX_LENGTH": 49152,
+        "TABLE_COMMENT": "博客文章表",
+        "ROW_FORMAT": "Dynamic",
+        "CREATE_OPTIONS": ""
+      },
+      "columns": [
+        {
+          "Field": "id",
+          "Type": "bigint unsigned",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "PRI",
+          "Default": null,
+          "Extra": "auto_increment",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章ID"
+        },
+        {
+          "Field": "topic",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "MUL",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "领域/分类"
+        },
+        {
+          "Field": "category",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "栏目/专栏"
+        },
+        {
+          "Field": "blog_type",
+          "Type": "varchar(32)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章类型"
+        },
+        {
+          "Field": "tags",
+          "Type": "varchar(255)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "标签，逗号分隔，形如 ,a,b,"
+        },
+        {
+          "Field": "word_count",
+          "Type": "int unsigned",
+          "Collation": null,
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "散文字数（由正文触发）"
+        },
+        {
+          "Field": "has_code",
+          "Type": "tinyint(1)",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "0",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "是否带代码示例"
+        },
+        {
+          "Field": "difficulty",
+          "Type": "tinyint",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "2",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "难度 1入门 2进阶 3深入"
+        },
+        {
+          "Field": "title",
+          "Type": "varchar(255)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "标题"
+        },
+        {
+          "Field": "author",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "作者"
+        },
+        {
+          "Field": "intro",
+          "Type": "varchar(500)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "摘要"
+        },
+        {
+          "Field": "blog_url",
+          "Type": "varchar(512)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章链接"
+        },
+        {
+          "Field": "publish_date",
+          "Type": "date",
+          "Collation": null,
+          "Null": "YES",
+          "Key": "MUL",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "发布日期"
+        },
+        {
+          "Field": "view_count",
+          "Type": "int unsigned",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "0",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "阅读量，用于排序"
+        },
+        {
+          "Field": "status",
+          "Type": "tinyint",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "1",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "1已发布 0草稿 -1下架"
+        }
+      ],
+      "indexes": [
+        {
+          "Table": "blog",
+          "Non_unique": 0,
+          "Key_name": "PRIMARY",
+          "Seq_in_index": 1,
+          "Column_name": "id",
+          "Collation": "A",
+          "Cardinality": 12,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog",
+          "Non_unique": 1,
+          "Key_name": "idx_topic_word",
+          "Seq_in_index": 1,
+          "Column_name": "topic",
+          "Collation": "A",
+          "Cardinality": 6,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog",
+          "Non_unique": 1,
+          "Key_name": "idx_topic_word",
+          "Seq_in_index": 2,
+          "Column_name": "word_count",
+          "Collation": "A",
+          "Cardinality": 12,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "YES",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog",
+          "Non_unique": 1,
+          "Key_name": "idx_topic_hot",
+          "Seq_in_index": 1,
+          "Column_name": "topic",
+          "Collation": "A",
+          "Cardinality": 6,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog",
+          "Non_unique": 1,
+          "Key_name": "idx_topic_hot",
+          "Seq_in_index": 2,
+          "Column_name": "view_count",
+          "Collation": "A",
+          "Cardinality": 12,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog",
+          "Non_unique": 1,
+          "Key_name": "idx_publish",
+          "Seq_in_index": 1,
+          "Column_name": "publish_date",
+          "Collation": "A",
+          "Cardinality": 12,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "YES",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        }
+      ],
+      "index_groups": [
+        {
+          "key_name": "PRIMARY",
+          "unique": true,
+          "type": "BTREE",
+          "columns": [
+            "id"
+          ],
+          "cardinality": 12,
+          "nullable": "",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        },
+        {
+          "key_name": "idx_topic_word",
+          "unique": false,
+          "type": "BTREE",
+          "columns": [
+            "topic",
+            "word_count"
+          ],
+          "cardinality": 6,
+          "nullable": "",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        },
+        {
+          "key_name": "idx_topic_hot",
+          "unique": false,
+          "type": "BTREE",
+          "columns": [
+            "topic",
+            "view_count"
+          ],
+          "cardinality": 6,
+          "nullable": "",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        },
+        {
+          "key_name": "idx_publish",
+          "unique": false,
+          "type": "BTREE",
+          "columns": [
+            "publish_date"
+          ],
+          "cardinality": 12,
+          "nullable": "YES",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        }
+      ],
+      "foreign_keys": [],
+      "checks": [],
+      "referenced_by": [
+        {
+          "CONSTRAINT_NAME": "fk_content_blog",
+          "TABLE_NAME": "blog_content",
+          "REFERENCED_TABLE_NAME": "blog",
+          "UPDATE_RULE": "NO ACTION",
+          "DELETE_RULE": "CASCADE",
+          "child_cols": "blog_id",
+          "parent_cols": "id"
+        }
+      ]
+    },
+    "blog_content": {
+      "kind": "BASE TABLE",
+      "table_meta": {
+        "TABLE_NAME": "blog_content",
+        "TABLE_TYPE": "BASE TABLE",
+        "ENGINE": "InnoDB",
+        "TABLE_COLLATION": "utf8mb4_0900_ai_ci",
+        "TABLE_ROWS": 1,
+        "DATA_LENGTH": 16384,
+        "INDEX_LENGTH": 16384,
+        "TABLE_COMMENT": "博客正文表",
+        "ROW_FORMAT": "Dynamic",
+        "CREATE_OPTIONS": ""
+      },
+      "columns": [
+        {
+          "Field": "blog_id",
+          "Type": "bigint unsigned",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "PRI",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        },
+        {
+          "Field": "content",
+          "Type": "longtext",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "MUL",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "正文 Markdown"
+        },
+        {
+          "Field": "content_fmt",
+          "Type": "varchar(16)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": "markdown",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        },
+        {
+          "Field": "toc",
+          "Type": "json",
+          "Collation": null,
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        },
+        {
+          "Field": "code_lang",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        },
+        {
+          "Field": "content_hash",
+          "Type": "char(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        },
+        {
+          "Field": "updated_at",
+          "Type": "datetime",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "CURRENT_TIMESTAMP",
+          "Extra": "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+          "Privileges": "select,insert,update,references",
+          "Comment": ""
+        }
+      ],
+      "indexes": [
+        {
+          "Table": "blog_content",
+          "Non_unique": 0,
+          "Key_name": "PRIMARY",
+          "Seq_in_index": 1,
+          "Column_name": "blog_id",
+          "Collation": "A",
+          "Cardinality": 1,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "",
+          "Index_type": "BTREE",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        },
+        {
+          "Table": "blog_content",
+          "Non_unique": 1,
+          "Key_name": "ft_content",
+          "Seq_in_index": 1,
+          "Column_name": "content",
+          "Collation": null,
+          "Cardinality": 1,
+          "Sub_part": null,
+          "Packed": null,
+          "Null": "YES",
+          "Index_type": "FULLTEXT",
+          "Comment": "",
+          "Index_comment": "",
+          "Visible": "YES",
+          "Expression": null
+        }
+      ],
+      "index_groups": [
+        {
+          "key_name": "PRIMARY",
+          "unique": true,
+          "type": "BTREE",
+          "columns": [
+            "blog_id"
+          ],
+          "cardinality": 1,
+          "nullable": "",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        },
+        {
+          "key_name": "ft_content",
+          "unique": false,
+          "type": "FULLTEXT",
+          "columns": [
+            "content"
+          ],
+          "cardinality": 1,
+          "nullable": "YES",
+          "comment": "",
+          "visible": "YES",
+          "expression": null
+        }
+      ],
+      "foreign_keys": [
+        {
+          "CONSTRAINT_NAME": "fk_content_blog",
+          "TABLE_NAME": "blog_content",
+          "REFERENCED_TABLE_NAME": "blog",
+          "UPDATE_RULE": "NO ACTION",
+          "DELETE_RULE": "CASCADE",
+          "child_cols": "blog_id",
+          "parent_cols": "id"
+        }
+      ],
+      "checks": [],
+      "referenced_by": []
+    },
+    "v_blog": {
+      "kind": "VIEW",
+      "table_meta": {
+        "TABLE_NAME": "v_blog",
+        "TABLE_TYPE": "VIEW",
+        "ENGINE": null,
+        "TABLE_COLLATION": null,
+        "TABLE_ROWS": null,
+        "DATA_LENGTH": null,
+        "INDEX_LENGTH": null,
+        "TABLE_COMMENT": "VIEW",
+        "ROW_FORMAT": null,
+        "CREATE_OPTIONS": null
+      },
+      "columns": [
+        {
+          "Field": "id",
+          "Type": "bigint unsigned",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "0",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章ID"
+        },
+        {
+          "Field": "title",
+          "Type": "varchar(255)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "标题"
+        },
+        {
+          "Field": "author",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "作者"
+        },
+        {
+          "Field": "topic",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "NO",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "领域/分类"
+        },
+        {
+          "Field": "category",
+          "Type": "varchar(64)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "栏目/专栏"
+        },
+        {
+          "Field": "blog_type",
+          "Type": "varchar(32)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章类型"
+        },
+        {
+          "Field": "tags",
+          "Type": "varchar(255)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "标签，逗号分隔，形如 ,a,b,"
+        },
+        {
+          "Field": "word_count",
+          "Type": "int unsigned",
+          "Collation": null,
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "散文字数（由正文触发）"
+        },
+        {
+          "Field": "difficulty",
+          "Type": "tinyint",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "2",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "难度 1入门 2进阶 3深入"
+        },
+        {
+          "Field": "has_code",
+          "Type": "tinyint(1)",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "0",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "是否带代码示例"
+        },
+        {
+          "Field": "intro",
+          "Type": "varchar(500)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "摘要"
+        },
+        {
+          "Field": "blog_url",
+          "Type": "varchar(512)",
+          "Collation": "utf8mb4_0900_ai_ci",
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "文章链接"
+        },
+        {
+          "Field": "view_count",
+          "Type": "int unsigned",
+          "Collation": null,
+          "Null": "NO",
+          "Key": "",
+          "Default": "0",
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "阅读量，用于排序"
+        },
+        {
+          "Field": "publish_date",
+          "Type": "date",
+          "Collation": null,
+          "Null": "YES",
+          "Key": "",
+          "Default": null,
+          "Extra": "",
+          "Privileges": "select,insert,update,references",
+          "Comment": "发布日期"
+        }
+      ],
+      "indexes": [],
+      "index_groups": [],
+      "foreign_keys": [],
+      "checks": [],
+      "referenced_by": []
+    }
+  },
+  "all_foreign_keys": [
+    {
+      "CONSTRAINT_NAME": "fk_content_blog",
+      "TABLE_NAME": "blog_content",
+      "REFERENCED_TABLE_NAME": "blog",
+      "UPDATE_RULE": "NO ACTION",
+      "DELETE_RULE": "CASCADE",
+      "child_cols": "blog_id",
+      "parent_cols": "id"
+    }
+  ],
+  "all_checks": [],
+  "triggers": [
+    {
+      "TRIGGER_NAME": "trg_blog_content_words_del",
+      "EVENT_MANIPULATION": "DELETE",
+      "EVENT_OBJECT_TABLE": "blog_content",
+      "ACTION_TIMING": "AFTER",
+      "ACTION_STATEMENT": "BEGIN\n    UPDATE `blog` SET `word_count` = NULL WHERE `id` = OLD.`blog_id`;\nEND"
+    },
+    {
+      "TRIGGER_NAME": "trg_blog_content_words_ins",
+      "EVENT_MANIPULATION": "INSERT",
+      "EVENT_OBJECT_TABLE": "blog_content",
+      "ACTION_TIMING": "AFTER",
+      "ACTION_STATEMENT": "BEGIN\n    UPDATE `blog` SET `word_count` = CHAR_LENGTH(COALESCE(NEW.`content`,''))\n     WHERE `id` = NEW.`blog_id`;\nEND"
+    },
+    {
+      "TRIGGER_NAME": "trg_blog_content_words_upd",
+      "EVENT_MANIPULATION": "UPDATE",
+      "EVENT_OBJECT_TABLE": "blog_content",
+      "ACTION_TIMING": "AFTER",
+      "ACTION_STATEMENT": "BEGIN\n    IF NOT (NEW.`content` <=> OLD.`content`) THEN\n        UPDATE `blog` SET `word_count` = CHAR_LENGTH(COALESCE(NEW.`content`,''))\n         WHERE `id` = NEW.`blog_id`;\n    END IF;\nEND"
+    }
+  ],
+  "fulltext_indexes": [
+    {
+      "table": "blog_content",
+      "index": "ft_content",
+      "columns": [
+        "content"
+      ]
+    }
+  ]
+}
