@@ -325,10 +325,49 @@ def _tool_node(cache_key: str, tool_name: str) -> ToolNode:
     return _tool_node_singleton[cache_key]
 
 
-def _degraded() -> dict:
-    """统一的降级返回：一句人设化提示 + 一个给路由看的失败标记。"""
+def _pending_tool_call_ids(state: RecommendState) -> list:
+    """找出上一节点发出、还没有任何 ToolMessage 应答的 tool_call_id。
+
+    为什么必须查这个：OpenAI 兼容接口有一条硬约束 ——
+    「任何带 tool_calls 的 assistant 消息，后面必须跟齐每一条 tool_call_id 对应的
+    tool 消息」。Conversation 一旦违反，**下一次**调模型就 400：
+        An assistant message with 'tool_calls' must be followed by tool messages
+        responding to each 'tool_call_id'.
+    卡点在于：降级是「半路」发生的。call_get_schema 已经把 tool_call 写进消息序列了，
+    紧接着 get_schema 连不上库 —— 如果这里直接返回一句话就收场，那条 tool_call
+    就成了孤儿，轮到 generate_query 调模型时整轮炸掉。
+    """
+    pending: dict = {}
+    for msg in state.get("messages") or []:
+        for call in getattr(msg, "tool_calls", None) or []:
+            call_id = call.get("id")
+            if call_id:
+                pending[call_id] = call.get("name") or "tool"
+        if isinstance(msg, ToolMessage):
+            pending.pop(msg.tool_call_id, None)
+    return [cid for cid in pending]
+
+
+def _degraded(state: RecommendState) -> dict:
+    """统一的降级返回：一句人设化提示 + 一个给路由看的失败标记。
+
+    关键：**顺带把悬空的 tool_call 应答掉**（见 _pending_tool_call_ids）。
+    没有这一步，降级就会把消息序列弄坏，下一个 LLM 节点必然 400 ——
+    那时候用户看到的是一坨 traceback，而不是这句人设化的提示。
+    """
+    outgoing: list = []
+    for call_id in _pending_tool_call_ids(state):
+        # 这一条不是「查询结果」，只是给协议一个交代；正文交代了取数没成。
+        outgoing.append(
+            ToolMessage(
+                content="取数失败：数据库不可用，这条工具调用没有执行。",
+                tool_call_id=call_id,
+                status="error",
+            )
+        )
+    outgoing.append(AIMessage(content=DB_UNAVAILABLE_REPLY))
     return {
-        "messages": [AIMessage(content=DB_UNAVAILABLE_REPLY)],
+        "messages": outgoing,
         "recommend_failed": True,
     }
 
@@ -339,7 +378,7 @@ def get_schema_node(state: RecommendState):
         return _tool_node("get_schema", "sql_db_schema").invoke(state)
     except Exception as exc:  # noqa: BLE001
         print(f"[recommend] 取表结构失败，降级：{_safe_err(exc)}")
-        return _degraded()
+        return _degraded(state)
 
 
 # 节点：执行sql查询（ToolNode 的降级包装）
@@ -348,7 +387,7 @@ def run_query_node(state: RecommendState):
         return _tool_node("run_query", "sql_db_query").invoke(state)
     except Exception as exc:  # noqa: BLE001
         print(f"[recommend] 执行查询失败，降级：{_safe_err(exc)}")
-        return _degraded()
+        return _degraded(state)
 
 
 # 节点：获取全量表（连不上库就降级，让图能收场而不是抛异常）
@@ -369,7 +408,7 @@ def list_tables(state: RecommendState):
         tool_message = list_tables_tool.invoke(tool_call)
     except Exception as exc:  # noqa: BLE001
         print(f"[recommend] 列表面失败，降级：{_safe_err(exc)}")
-        return _degraded()
+        return _degraded(state)
 
     # 整合结果
     response = AIMessage(content=f"可用的表:{tool_message.content}")
@@ -382,7 +421,7 @@ def call_get_schema(state: RecommendState):
         get_schema_tool = _tool("sql_db_schema")
     except Exception as exc:  # noqa: BLE001
         print(f"[recommend] 取表结构工具不可用，降级：{_safe_err(exc)}")
-        return _degraded()
+        return _degraded(state)
     llm_with_tools = model.bind_tools([get_schema_tool], tool_choice="any")
     # llm 根据历史消息筛选表，并获取需要的表信息
     response = llm_with_tools.invoke(state["messages"])
@@ -420,14 +459,22 @@ def generate_query(state: RecommendState):
         dialect = get_db().dialect
     except Exception as exc:  # noqa: BLE001
         print(f"[recommend] 生成查询前连库失败，降级：{_safe_err(exc)}")
-        return _degraded()
+        return _degraded(state)
     system_prompt = generate_query_system_prompt.format(
         dialect=dialect, top_k=state.get("blog_count", 5)
     )
     system_message = SystemMessage(content=system_prompt)
     # 取数要的是稳定，不是文采 —— 固定用低温度的那个模型。
     llm_with_tools = model_deterministic.bind_tools([_tool("sql_db_query")])
-    return {"messages": [llm_with_tools.invoke([system_message] + state["messages"])]}
+    try:
+        response = llm_with_tools.invoke([system_message] + state["messages"])
+    except Exception as exc:  # noqa: BLE001
+        # 调不动模型（网络 / 限流 / 上游报错）也走降级：用户该看到那句人设话，
+        # 而不是一坨 traceback。_degraded 会顺带把在飞的 tool_call 应答掉，
+        # 消息序列不会因此坏掉。
+        print(f"[recommend] 生成查询失败，降级：{_safe_err(exc)}")
+        return _degraded(state)
+    return {"messages": [response]}
 
     # QuerySQLDatabaseTool
     # tool_call: {

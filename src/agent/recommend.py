@@ -45,7 +45,13 @@ builder.add_edge("call_get_schema", "get_schema")
 builder.add_edge("get_schema", "generate_query")
 
 def should_continue(state: RecommendState):
-    # 查询跑挂了 → 收场，别再让 LLM 接着编
+    # 这一轮已经降级 → 直接收场。
+    # 顺序很重要：这个判断必须在读 tool_calls 之前。
+    # 降级时最后一条 AI 消息是「我连不上…」这句人设话，没有 tool_calls，
+    # 落到下面的分支就会被当成「取数结束」送去 compose_answer，
+    # 等于用降级话术冒充正常收尾；更早的版本还会让图继续跑到
+    # generate_query，带着一条没人应答的 tool_call 去调模型，直接 400。
+    # state 里已经有 recommend_failed（上游 _degraded 置的位），这里直接收。
     if state.get("recommend_failed"):
         return END
     last_msg = state["messages"][-1]
