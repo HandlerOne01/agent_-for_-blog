@@ -6,7 +6,7 @@
   "graphs": {
     "blog_agent": "./src/agent/graph.py:graph",
     "recommended_agent": "./src/agent/recommend.py:recommended_graph",
-    "collect_agent": "./src/agent/collect.py:collect_graph",
+    "introduce_agent": "./src/agent/introduce.py:introduce_graph",
     "extend_agent": "./src/agent/extend.py:extend_graph"
   },
   "env": ".env",

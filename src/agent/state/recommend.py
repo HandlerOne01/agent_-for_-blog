@@ -21,6 +21,12 @@ class RecommendState(MessagesState):
     # 而不是带着坏数据继续往下走到"答复"节点。
     recommend_failed: bool
 
+    # 本轮推荐出的候选（title/category/word_count/difficulty/blog_url）。
+    # 必须在这里声明：compose_answer 返回它，而**未声明的键会被 LangGraph 静默丢弃**，
+    # 于是父图收不到、也就问不出"要不要我讲讲其中一篇"。
+    # 这与 recommend_failed 要声明在父图 State 是同一个道理（两边都要有）。
+    recommended_posts: list[dict]
+
 # 获取推荐信息方法
 def get_recommend_info(state: dict) -> str:
     info_prompt = """

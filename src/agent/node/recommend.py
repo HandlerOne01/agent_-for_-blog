@@ -25,8 +25,20 @@ from pydantic import BaseModel, Field
 from structlog.tracebacks import extract
 
 from src.agent.common.context import ContextSchema, get_user_id
+from src.agent.common.db import (
+    DBUnavailable,
+    db_uri as _db_uri,
+    get_db,
+    get_engine,
+    safe_err as _safe_err,
+)
 from src.agent.common.llm import model, model_deterministic
 from src.agent.common.persona import with_persona
+from src.agent.common.reply import (
+    DB_UNAVAILABLE_REPLY as _DB_UNAVAILABLE_REPLY,
+    degrade_reply as _degrade_reply,
+    pending_tool_call_ids as _pending_tool_call_ids,
+)
 from src.agent.common.store import UserPreferences
 from src.agent.state.recommend import RecommendState, get_recommend_info
 
@@ -36,7 +48,11 @@ class UserInfo(BaseModel):
 
     topic: Optional[str] = Field(
         default=None,
-        description="用户想要阅读的博客领域/分类，例如：人工智能、前端开发、数据库、职场成长",
+        description=(
+            "用户想看的**主题**（领域/方向/技术栈），例如：八股文、C++、计算机网络、"
+            "人工智能、前端开发、数据库、职场成长。"
+            "判断依据是'这文章讲什么'，而不是'这文章是什么体裁'。"
+        ),
     )
     category: Optional[str] = Field(
         default=None,
@@ -52,7 +68,11 @@ class UserInfo(BaseModel):
     )
     blog_type: Optional[str] = Field(
         default=None,
-        description="文章类型，例如：教程、实战、原理剖析、随笔、踩坑记录、工具介绍",
+        description=(
+            "文章的**体裁**（写法/呈现形式），例如：教程、实战、原理剖析、随笔、"
+            "踩坑记录、工具介绍。"
+            "只放体裁，**不要**把主题词放进来 —— '八股文'是主题不是体裁，它属于 topic。"
+        ),
     )
     tags: Optional[str] = Field(
         default=None,
@@ -72,24 +92,19 @@ def collect_user_info(
 ):
     """收集用户希望的推荐信息"""
 
-    # 1. 获取需要被解析的数据：最新的用户消息 + 用户的偏好数据
-    # 场景1：
-    # 最新的用户消息： 人工智能 3篇
-    # 用户的偏好数据： 字数 1000-2000字
+    # 1. 获取需要被解析的数据：**只看本轮用户消息**。
+    # 历史偏好不参与抽取，只作为兜底默认值（见下面第 3 步）。
+    #
+    # 为什么不把历史偏好拼进来：原来这里会把 store 里的偏好拼成一条 HumanMessage
+    #     "用户的历史偏好信息如下：1. 最少字数：500 2. 最多字数：5000"
+    # 和本轮消息一起喂给抽取模型。提示词虽然写了"只提取用户明确提到的信息"，
+    # 但模型把这条**横幅本身**当成了用户的陈述，于是把 500-5000 原样抽出来、
+    # 写回 state、拼进 SQL：
+    #     ... WHERE id IN (...) AND word_count >= 500 AND word_count <= 5000
+    # 后果是"默认按 500-5000 筛"，而且每轮复现。
+    # 现在：没提字数就是不筛（两个字段保持 None）。
     user_messages = filter_messages(state["messages"], include_types=["human"])
-    pref = state.get("user_preferences")
-    if pref and (pref.get("word_count_min") or pref.get("word_count_max")):
-        # 偏好中包含最少和最多字数
-        extract_messages = [
-            HumanMessage(
-                content="用户的历史偏好信息如下："
-                f"1. 最少字数：{pref.get('word_count_min')}"
-                f"2. 最多字数：{pref.get('word_count_max')}"
-            ),
-            user_messages[-1],
-        ]
-    else:  # 无偏好数据
-        extract_messages = user_messages[-1]
+    extract_messages = user_messages[-1]
 
     # 2. 提取信息(LLM结构化返回)
     # 拓展：将信息与数据库表中的字段进行映射
@@ -100,8 +115,29 @@ def collect_user_info(
 如果用户历史偏好信息与最新用户消息冲突，以最新的用户消息为主。
 只提取用户明确提到的信息，不要猜测或推断。
 如果某个信息用户没有提到，就返回null。
+
+【字段分工：主题 vs 体裁（"讲什么" vs "怎么写"）—— 这里最容易错】
+- topic = **主题**：文章讲的是什么领域/方向/技术。
+- blog_type = **体裁**：文章用什么形式写（教程/实战/原理剖析/随笔/踩坑记录/工具介绍）。
+- "八股文"是**主题**（面试知识这个领域），不是体裁，绝不放进 blog_type。
+
+【映射示例（照着做）】
+  "推荐几篇八股文"           → topic="八股文"
+  "推荐几篇 C++ 的八股文"     → topic="八股文"、tags="C++"
+  "C++ 方向的八股文"          → topic="八股文"、tags="C++"
+  "推荐几篇 C++ 的文章"       → topic="C++"
+  "来点实战教程"              → blog_type="实战"
+
 注意字数的单位可能是字、千字、万字等，请统一转换为字。
-如果用户提到篇幅范围，请分别提取最少字数和最多字数。
+
+【字数：默认不限，只有用户明确说了才填】
+- 用户说"不限 / 随便 / 都行 / 无所谓 / 不用管字数" → word_count_min 和
+  word_count_max **都返回 null**（= 不按字数筛），不要填 0 或 20000。
+- "xx字以内" → word_count_min=0、word_count_max=xx
+- "xx字以上" → word_count_min=xx（不要凭空设 word_count_max）
+- 只说了范围 → 分别提取最少字数和最多字数
+- **没说 → 两个都返回 null**（不要替用户设默认区间）
+
 如果用户提到推荐几篇文章，提取blog_count字段。"""
         )
         if not isinstance(messages, list):
@@ -132,34 +168,38 @@ def collect_user_info(
     # 最新的用户消息：给我推荐几篇博客（并未表明推荐领域，模糊推荐）
     # 询问用户意向领域
 
-    # 检查是否缺失关键信息: 领域、字数范围
-    missing_info = []
-    if not updated_state.get("topic"):
-        missing_info.append("方向（想看哪一块）")
-    if (
+    # 检查缺失信息。
+    # 「方向」是**必填**：没有它就没法定位文章，只能问。
+    # 「篇幅」是**可选**：没提就不筛（曾经在这里硬要求，逼得每次多问一轮）。
+    #   为什么不再把它当成"没说清"：用户说"C++ 方向"时问题其实已经答得清清楚楚，
+    #   再去问篇幅只会让人觉得"我问了 A 你反问 B"。
+    #   但篇幅又确实决定候选（'八股文' 那 12 篇从 3.9千字到 17万字），
+    #   所以用一轮"顺带问一句"换取结果的贴合度，用户回「不提供」就直接跳过。
+    topic_missing = not updated_state.get("topic")
+    word_count_missing = (
         updated_state.get("word_count_min") is None
         or updated_state.get("word_count_max") is None
-    ):
-        missing_info.append("篇幅（大概多少字、能看多久）")
+    )
 
-    if missing_info:
+    if topic_missing:
         # 中断文案用爱弥斯口吻：不用「您」，不是客服话术。
         # 「不提供」这个约定词必须原样保留 —— 下面就是靠它判断用户是否放弃补充。
-        prompt = f"行，我去翻。不过你还没说清：{'；'.join(missing_info)}。\n"
-        prompt += (
-            "不想说也行，回我「不提供」——我按站里的常用范围替你挑，"
-            "挑完你再嫌。"
-        )
+        prompt = "行，我去翻。不过你想看哪一块？给我个方向就行。\n"
+        if word_count_missing:
+            prompt += "顺带说句篇幅（大概多少字、能看多久），嫌烦就回我「不提供」。"
+        else:
+            prompt += "不想说也行，回我「不提供」——我按你说的范围挑，挑完你再嫌。"
         # 根据缺失的信息进行中断
         answer = interrupt(prompt)
         if str(answer).strip() == "不提供":
-            # 已经缺失关键信息，而且用户还不提供。需要给关键信息设置默认值
-            if not updated_state.get("topic"):
-                updated_state["topic"] = "随机领域"
-            if not updated_state.get("word_count_min"):
-                updated_state["word_count_min"] = 500
-            if not updated_state.get("word_count_max"):
-                updated_state["word_count_max"] = 5000
+            # 用户放弃补充。
+            #
+            # 字数**不设默认值**：没提就是不筛。曾经这里硬塞 500-5000，
+            # 结果 category='八股文' 的 12 篇里有 11 篇（1.5万~17万字）被筛掉，
+            # 用户只拿到 1 篇，看起来像"召回坏了"。
+            #
+            # 方向也**不塞占位**："随机领域"这种词会被拼进向量查询串，凭空
+            # 干扰召回（实测它能让 top1 掉出门槛）。宁可什么都不筛。
             if not updated_state.get("blog_count"):
                 updated_state["blog_count"] = 5
         else:
@@ -219,6 +259,9 @@ def collect_user_info(
                 )
                 updated_state["user_preferences"] = prefs
 
+    # 新一轮推荐不继承上次的失败或候选；父图与独立推荐入口均适用。
+    updated_state.update(recommend_failed=False, recommended_posts=[])
+
     # 5. 准备最终的消息，并更新
     updated_state["messages"] = [
         HumanMessage(content=get_recommend_info(updated_state))
@@ -249,55 +292,26 @@ def collect_user_info(
 # 库名走 DB_NAME 环境变量，所以可以临时指向影子库/不存在的库做验证。
 # ============================================================================
 
-# 数据库不可用时，代替推荐结果说的话（爱弥斯口吻，不用「您」）。
-DB_UNAVAILABLE_REPLY = (
-    "我连不上放文章的那个地方了。这会儿找不了文章，聊天还行——"
-    "你要不要先随便问我点别的？"
-)
+# 数据库不可用时代替推荐结果说的话：实现已抽到 common/reply.py，
+# 这里保留同名引用，调用方与测试都按原名使用。
+DB_UNAVAILABLE_REPLY = _DB_UNAVAILABLE_REPLY
 
 # 推荐答复只认这五列，且顺序固定 —— 与 generate_query 里的取数列约定一致。
 RECO_COLUMNS = ("title", "category", "word_count", "difficulty", "blog_url")
+
+# 向量召回少于这个数就算"太单薄"，交回数据库检索（LLM 写 SQL，可写多列 LIKE）。
+# 3 是用户定的阈值：>=3 篇按向量走，<3 篇才补检索。
+# 定太高的代价是每次多一次 LLM 调用；定太低（比如 1）则几乎永远走不到那条路。
+VECTOR_MIN_HITS = 3
 
 # 站内文章总数，是个事实常量；它不算「本轮结果集的条数」。
 LIB_TOTAL = 133
 
 
-class DBUnavailable(RuntimeError):
-    """数据库连不上。用于让节点降级，而不是让整张图炸掉。"""
-
-
-def _db_uri() -> str:
-    """按环境变量拼连接串。库名可被 DB_NAME 覆盖（便于指向影子库做验证）。"""
-    return (
-        f"mysql+pymysql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
-        f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-    )
-
-
-def _safe_err(exc: BaseException) -> str:
-    """异常文本里可能带着含密码的连接串。落日志之前先把密码抹掉。"""
-    msg = f"{type(exc).__name__}: {exc}"
-    secret = os.getenv("DB_PASSWORD")
-    if secret:
-        msg = msg.replace(secret, "***")
-    return msg
-
-
-_db_singleton: Optional[SQLDatabase] = None
+# 数据库连接与错误脱敏的实现已抽到 common/db.py（介绍模块也要用，
+# 但它不该反向 import 本模块）。_tools_singleton 是本模块自己的缓存。
 _tools_singleton: Optional[list] = None
 _tool_node_singleton: dict = {}
-
-
-def get_db() -> SQLDatabase:
-    """首次调用时才真正连库；连不上抛 DBUnavailable。"""
-    global _db_singleton
-    if _db_singleton is None:
-        try:
-            _db_singleton = SQLDatabase.from_uri(_db_uri())
-        except Exception as exc:  # noqa: BLE001 任何连接/握手问题都走同一条降级路径
-            _db_singleton = None
-            raise DBUnavailable(_safe_err(exc)) from exc
-    return _db_singleton
 
 
 def get_sql_tools() -> list:
@@ -306,6 +320,24 @@ def get_sql_tools() -> list:
     if _tools_singleton is None:
         _tools_singleton = SQLDatabaseToolkit(db=get_db(), llm=model).get_tools()
     return _tools_singleton
+
+
+# 词法锚点用的短字段，包含体裁别名依赖的 blog_type；不读 intro/content。
+_anchor_rows_cache: Optional[list] = None
+
+
+def _anchor_rows() -> Optional[list]:
+    """给 retrieval.anchor_ids 用的行快照。查不动就返回 None（锚点作废）。"""
+    global _anchor_rows_cache
+    if _anchor_rows_cache is None:
+        from sqlalchemy import text
+
+        with get_engine().connect() as conn:
+            result = conn.execute(
+                text("SELECT id, title, topic, category, tags, blog_type FROM blog")
+            )
+            _anchor_rows_cache = [dict(row._mapping) for row in result]
+    return _anchor_rows_cache
 
 
 def _tool(name: str):
@@ -325,51 +357,17 @@ def _tool_node(cache_key: str, tool_name: str) -> ToolNode:
     return _tool_node_singleton[cache_key]
 
 
-def _pending_tool_call_ids(state: RecommendState) -> list:
-    """找出上一节点发出、还没有任何 ToolMessage 应答的 tool_call_id。
-
-    为什么必须查这个：OpenAI 兼容接口有一条硬约束 ——
-    「任何带 tool_calls 的 assistant 消息，后面必须跟齐每一条 tool_call_id 对应的
-    tool 消息」。Conversation 一旦违反，**下一次**调模型就 400：
-        An assistant message with 'tool_calls' must be followed by tool messages
-        responding to each 'tool_call_id'.
-    卡点在于：降级是「半路」发生的。call_get_schema 已经把 tool_call 写进消息序列了，
-    紧接着 get_schema 连不上库 —— 如果这里直接返回一句话就收场，那条 tool_call
-    就成了孤儿，轮到 generate_query 调模型时整轮炸掉。
-    """
-    pending: dict = {}
-    for msg in state.get("messages") or []:
-        for call in getattr(msg, "tool_calls", None) or []:
-            call_id = call.get("id")
-            if call_id:
-                pending[call_id] = call.get("name") or "tool"
-        if isinstance(msg, ToolMessage):
-            pending.pop(msg.tool_call_id, None)
-    return [cid for cid in pending]
-
-
 def _degraded(state: RecommendState) -> dict:
-    """统一的降级返回：一句人设化提示 + 一个给路由看的失败标记。
+    """统一的降级返回（实现已抽到 common/reply.py）。
 
-    关键：**顺带把悬空的 tool_call 应答掉**（见 _pending_tool_call_ids）。
+    关键行为不变：**顺带把悬空的 tool_call 应答掉**（见 pending_tool_call_ids）。
     没有这一步，降级就会把消息序列弄坏，下一个 LLM 节点必然 400 ——
     那时候用户看到的是一坨 traceback，而不是这句人设化的提示。
+
+    这里保留原名与原签名，是为了不动调用方，也不动
+    tests/unit_tests/test_recommend_degrade.py（它直接导入这个名字）。
     """
-    outgoing: list = []
-    for call_id in _pending_tool_call_ids(state):
-        # 这一条不是「查询结果」，只是给协议一个交代；正文交代了取数没成。
-        outgoing.append(
-            ToolMessage(
-                content="取数失败：数据库不可用，这条工具调用没有执行。",
-                tool_call_id=call_id,
-                status="error",
-            )
-        )
-    outgoing.append(AIMessage(content=DB_UNAVAILABLE_REPLY))
-    return {
-        "messages": outgoing,
-        "recommend_failed": True,
-    }
+    return _degrade_reply(state, mark="recommend_failed")
 
 
 # 节点：获取表信息（ToolNode 的降级包装）
@@ -432,6 +430,171 @@ def call_get_schema(state: RecommendState):
 # 注意：这个节点**只负责取数**，不负责「说给用户听」。
 # 答复由 compose_answer 用人设重新组织 —— 见下面的说明。
 def generate_query(state: RecommendState):
+    # ========================================================================
+    # 【向量召回】先按"意思"挑出候选 id，拼一条只含 id 条件的 SQL 交下去。
+    #   命中  → 直接返回 AIMessage(tool_call)，后面的 check_query / run_query /
+    #           compose_answer 原样工作（SQL 是真 SQL，ToolMessage 也是真的）
+    #   没命中 / 索引没建 / 接口挂 → 往下走，用原来那套 LLM 写 SQL
+    # 下面原有代码一个字未改。
+    #
+    # 为什么这么接：向量只负责"挑哪几篇"，取字段和字数过滤仍然交给数据库，
+    # 图、state、compose_answer 一个都不用动。
+    # ========================================================================
+    from src.agent.common import retrieval  # 局部 import：它坏了也不影响本模块加载
+
+    query_text = " ".join(
+        str(state.get(f) or "")
+        for f in ("topic", "category", "tags", "blog_type", "others")
+    ).strip()
+    # 查询串重复一遍再喂给向量。为什么：
+    # 用户只说一个分类名时（"推荐几篇八股文"→ topic="八股文"），单次出现的
+    # 查询在向量空间里"锚点太弱"：top1 只有 0.562，刚好过 0.50 的门，
+    # 但 max(0.45, top1-0.15)=0.45 的尾巴把其余候选全砍掉，只召回 1 篇。
+    # 实测同一串重复一遍：top1 升到 0.668，召回从 1 篇变 5 篇；
+    # "Linux" 从 0 篇（被门槛拦）变 6 篇；"网络" 从 3 篇变 7 篇。
+    # 长查询（"C++ 智能指针"这类）本来召回就满，重复不影响。
+    _vec_query = (query_text + " " + query_text).strip() if query_text else ""
+
+    # ========================================================================
+    # 【分类词锚点】先用词法确认"用户说的这几个词在库里到底指什么"，把范围收住。
+    #   为什么不是纯向量：向量对分类词不可靠，实测（库 133 篇）
+    #       "八股文"     词法 12 篇全对 / 向量只召回 5 篇
+    #       "C++"        词法 36 篇太宽 / 向量 10 篇
+    #       "C++ 八股文" 词法 0 篇      / 向量 1 篇 0.826
+    #   两条路各有死角 → 词法收范围，向量在范围内排序；交集为空就退回纯向量。
+    #
+    #   候选串**按可信度排序**、每串各算一次锚点，然后取**最紧**的那个（候选最少）。
+    #   为什么不是"第一个能锚住就算"：实测"C++ 方向"+ tags='八股文' 里，
+    #   第一串 "C++" 能锚住 4 篇（都是 C/C++ 语言笔记），而第二串
+    #   "C++ 八股文" 求交只有 1 篇 —— 那 1 篇才是用户要的。先到先得会选错。
+    #   为什么要按可信度排序：紧到 0 篇的串必须被排除（空集不是"更精确"），
+    #   平手时用排在前面的那串。
+    #   每串各自求交、而不是把所有串的词汇成一个大集合：后者是**两次不同的
+    #   猜测**交叉，会交叉出空集，把本来能锚住的候选清掉。
+    # 下面原有代码一个字未改，只是被套进了这个分工里。
+    # ========================================================================
+    def _slots(*names):
+        return " ".join(str(state.get(f) or "") for f in names).strip()
+
+    _anchor_phrases = [
+        _slots("topic", "tags"),
+        _slots("topic", "tags", "blog_type", "category"),
+        query_text,
+    ]
+    _anchor = None
+    try:
+        _rows = _anchor_rows()
+        if _rows:
+            for _phrase in _anchor_phrases:
+                _got = retrieval.anchor_ids(_phrase, _rows)
+                if _got and (_anchor is None or len(_got) < len(_anchor)):
+                    _anchor = _got
+            if _anchor:
+                print(f"[recommend] 词法锚点 {len(_anchor)} 篇候选 → 向量只在此范围内排序")
+    except Exception as exc:  # noqa: BLE001 锚点只是加分项，坏了不该把推荐拖垮
+        print(f"[recommend] 词法锚点异常，回落纯向量：{_safe_err(exc)}")
+
+    if query_text:
+        # 只在【第一轮】走向量近路。
+        #
+        # 为什么必须加这道闸：下面的早返回会直接产出 tool_call，而
+        # should_continue 看到 tool_calls 就路由到 check_query → run_query →
+        # 又回到本节点。run_query 成功时 db_ready=ok 也回到本节点，于是
+        # 第二轮又命中同一条向量、又早返回同一条 SQL —— 图永远走不到
+        # compose_answer（那个节点才是让 should_continue 收到"无 tool_calls"
+        # 从而刹车的终点），表现为无限循环。
+        #
+        # 判据：消息里已经出现过 sql_db_query 的 ToolMessage（即上一轮在
+        # list_tables 的 sql_db_list_tables 之后真的查过库）→ 这一轮交给下面
+        # 的 LLM 链路收尾。降级时 ToolMessage 的正文是 DB_UNAVAILABLE_REPLY。
+        # 不再查第二次向量，也省掉一次 embedding API 调用。
+        _already_queried = any(
+            isinstance(msg, ToolMessage)
+            and (
+                (getattr(msg, "name", None) or "") == "sql_db_query"
+                or str(msg.content or "").startswith(DB_UNAVAILABLE_REPLY)
+            )
+            for msg in (state.get("messages") or [])
+        )
+        if _already_queried:
+            print("[recommend] 本轮已查过库，跳过向量召回，交给 LLM 链路收尾")
+        try:
+            if _already_queried:
+                hits = None
+            else:
+                # 有锚点时把 k 开到候选规模，让 rank_within 有足够多的分数可挑，
+                # 否则候选里排在 k 名之外的会被"没进前 k"误伤。
+                _k = max(int(state.get("blog_count") or 0), retrieval.RECALL_TOP_K)
+                if _anchor:
+                    _k = max(_k, len(_anchor))
+                hits = retrieval.search_ids(_vec_query, k=_k)
+
+                # ----------------------------------------------------------
+                # 阈值判的是**向量原始召回数**（锚点收窄之前）。
+                #
+                # 为什么必须在收窄之前判：锚点是"精准收窄"，它把 12 篇收成 1 篇
+                # 属于正常工作；若拿收窄后的数量去比阈值，越是精准的锚点越会被
+                # 判成"召回太少"而绕过自己，等于白做。
+                # 这里要回答的问题是"库/索引对这句话能给出多少东西"，
+                # 那是向量自己的事。
+                #
+                # 少于 VECTOR_MIN_HITS 篇 → 交回下面的「数据库检索」（LLM 写 SQL，
+                # 那条路能写多列 LIKE）。原来只判 `if hits:`，哪怕只召回 1 篇
+                # 也算命中、直接早返回，于是那条数据库检索路几乎永远走不到。
+                # ----------------------------------------------------------
+                if hits is not None and len(hits) < VECTOR_MIN_HITS:
+                    print(
+                        "[recommend] 向量只召回 %d 篇（< %d），回落数据库检索"
+                        % (len(hits), VECTOR_MIN_HITS)
+                    )
+                    hits = None
+
+                if hits and _anchor:
+                    ranked = retrieval.rank_within(_anchor, hits)
+                    if ranked:
+                        _keep = set(ranked)
+                        hits = [(i, s) for i, s in hits if i in _keep]
+                    else:
+                        # 锚点跟语义对不上（或索引挂了）→ 放弃收窄，别硬撑
+                        print("[recommend] 锚点内一篇都没排上，退回全库向量结果")
+
+                # 保留候选，先让 SQL 过滤字数和发布状态，再按相关性取前 N 篇。
+        except Exception as exc:  # noqa: BLE001 召回只是加分项，不许把推荐拖垮
+            print(f"[recommend] 向量召回异常，回落 SQL：{_safe_err(exc)}")
+            hits = None
+        if hits:
+            # status = 1（已发布）是硬条件：草稿/下架文章不该被推荐。
+            ranked_ids = ", ".join(str(int(i)) for i, _ in hits)
+            conds = ["status = 1", "id IN (%s)" % ranked_ids]
+            if state.get("word_count_min"):
+                conds.append("word_count >= %d" % int(state["word_count_min"]))
+            if state.get("word_count_max"):
+                conds.append("word_count <= %d" % int(state["word_count_max"]))
+            sql = (
+                "SELECT title, category, word_count, difficulty, blog_url "
+                "FROM blog WHERE " + " AND ".join(conds)
+                + " ORDER BY FIELD(id, " + ranked_ids + ")"
+            )
+            want = int(state.get("blog_count") or 0)
+            if want > 0:
+                sql += " LIMIT %d" % want
+            print(f"[recommend] 向量召回 {len(hits)} 篇 → {sql}")
+            return {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "sql_db_query",
+                                "args": {"query": sql},
+                                "id": "vec-" + uuid.uuid4().hex[:8],
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            }
+
     generate_query_system_prompt = """
     你是一个只负责取数的 SQL 代理。
     给定一个输入问题，创建一个语法正确的{dialect}查询来运行。
@@ -844,4 +1007,6 @@ def compose_answer(state: RecommendState):
         print(f"[recommend] 人设化答复未通过校验，退模板：{problems}")
         rendered = _template_reply(posts)
 
-    return _reply(state, rendered)
+    # 顺手把候选写进共享状态：父图跑完推荐后要拿它问「要不要我讲讲其中一篇」。
+    # posts 已经在手上，不需要额外查询。
+    return dict(_reply(state, rendered), recommended_posts=posts)
