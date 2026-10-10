@@ -91,7 +91,9 @@ def test_interrupt_asks_for_direction_not_complains_about_word_count():
     seen = {}
 
     def _capture(prompt):
-        seen["prompt"] = prompt
+        # v1.99（前端 v1.100）：`interrupt` 的载荷改成结构化 dict（多了 kind/options/default，
+        # 给前端判断"该回哪个词 / 要不要替答"）—— 这句问句本身在 `value` 里，断言口径不变。
+        seen["prompt"] = prompt.get("value", "") if isinstance(prompt, dict) else prompt
         return "不提供"
 
     with patch.object(R, "interrupt", side_effect=_capture), patch.object(

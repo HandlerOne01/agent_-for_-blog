@@ -105,9 +105,17 @@ def need_introduce(state: State) -> NeedIntroduceOutput:
         )
         for i, p in enumerate(posts, 1)
     )
-    answer = interrupt(
-        "上面这些，要不要我挑一篇给你讲讲？回序号就行，不用就回「不用」：\n" + lines
-    )
+    # ⚠️ v1.99（前端 v1.100）：结构化载荷 —— 这一问也是**选择题**（回序号，或回「不用」），
+    #    所以 `default=None`：前端**不许替用户答**（替答的后果实测过 —— 前端曾拿约定词
+    #    「不提供」去打这种问句，于是那句反问从来没上屏，用户只看到后面一句"没定位到"）。
+    #    ⚠️ 这一句的问法（「回序号就行」）**正好不在前端那几条正则里** —— 结构化载荷到位之前，
+    #    前端会把它归到"可续跑"那一类（这正是本次要根治的问题）。
+    answer = interrupt({
+        "value": "上面这些，要不要我挑一篇给你讲讲？回序号就行，不用就回「不用」：\n" + lines,
+        "kind": "choice",
+        "options": [str(i) for i in range(1, len(posts) + 1)] + ["不用"],
+        "default": None,
+    })
     picked = _pick_recommended_post(answer, posts)
     if picked is None:
         return {"introduce_choice": "不用", "target_query": ""}

@@ -30,6 +30,7 @@ from src.agent.common.db import (
     db_uri as _db_uri,
     get_db,
     get_engine,
+    is_disconnect,
     safe_err as _safe_err,
 )
 from src.agent.common.llm import model, model_deterministic
@@ -190,7 +191,20 @@ def collect_user_info(
         else:
             prompt += "不想说也行，回我「不提供」——我按你说的范围挑，挑完你再嫌。"
         # 根据缺失的信息进行中断
-        answer = interrupt(prompt)
+        # ⚠️ v1.99（前端 v1.100）：`interrupt` 的载荷改成**结构化**的 —— 前端不必再从问句
+        #    措辞里正则猜"该回哪个约定词"（契约见 imiss_-blog 的 ARCH.md §8.9.5）。
+        #    `value` 仍是**给人看的问句**（LangSmith / 任何只看文本的消费者照旧）；
+        #    多出来的 kind / options / default 只给前端用：
+        #      kind="word_count" → 这是"可续跑"的那一类（不是选择题）
+        #      options            → 允许的回答（就是前端那三个约定词）
+        #      default="不提供"    → 前端推不出用户意图时该回哪个词（= 放弃补充，别筛字数）
+        #    ⚠️ `interrupt()` 的**返回值**不受影响（仍是用户在 resume 里说的那句话）。
+        answer = interrupt({
+            "value": prompt,
+            "kind": "word_count",
+            "options": ["不提供", "需要", "不需要"],
+            "default": "不提供",
+        })
         if str(answer).strip() == "不提供":
             # 用户放弃补充。
             #
@@ -372,11 +386,15 @@ def _degraded(state: RecommendState) -> dict:
 
 # 节点：获取表信息（ToolNode 的降级包装）
 def get_schema_node(state: RecommendState):
-    try:
-        return _tool_node("get_schema", "sql_db_schema").invoke(state)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[recommend] 取表结构失败，降级：{_safe_err(exc)}")
-        return _degraded(state)
+    for attempt in range(2):
+        try:
+            return _tool_node("get_schema", "sql_db_schema").invoke(state)
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 0 and is_disconnect(exc):
+                print(f"[recommend] 取表结构时连接丢失，重试一次：{_safe_err(exc)}")
+                continue
+            print(f"[recommend] 取表结构失败，降级：{_safe_err(exc)}")
+            return _degraded(state)
 
 
 # 节点：执行sql查询（ToolNode 的降级包装）

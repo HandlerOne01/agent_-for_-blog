@@ -56,8 +56,7 @@ def extract_title(state: IntroduceState) -> dict:
     挑中的篇名预填进 target_query。此时不能再去抽 —— 用户答的是序号（"1"），
     抽出来会是个无效篇名，拿去 LIKE 标题必然 0 命中。顺带也省一次 LLM 调用。
 
-    **异常在这里吞掉是有意的**：调用方 locate_article 的降级是"给用户一句
-    人话"，不是重试；抽取失败降级为空篇名，用户会看到"没定位到"。
+    抽取为空或失败时保留用户原话，让定位节点继续检索，不能冒充查询无结果。
     """
     preset = str(state.get("target_query") or "").strip()
     if preset:
@@ -71,15 +70,21 @@ def extract_title(state: IntroduceState) -> dict:
                 SystemMessage(
                     content="从用户的话里找出他想要介绍的那篇文章的篇名。"
                     "只返回篇名本身，不要带「这篇」「那篇」「介绍」等词。"
-                    "用户没有点名具体文章时返回空字符串。"
+                    "项目名称、简称也属于检索词，例如「个人博客助手这个项目」"
+                    "应返回「个人博客助手」。用户没有提供检索线索时返回空字符串。"
                 ),
                 state["messages"][-1],
             ]
         )
         query = (info.query or "").strip()
     except Exception as exc:  # noqa: BLE001 抽取失败降级为空篇名，绝不冒 traceback
-        print(f"[introduce] 篇名抽取失败，按没点名处理：{exc}")
+        print(f"[introduce] 篇名抽取失败，回退用户原话检索：{exc}")
         query = ""
+    if not query:
+        query = next(
+            (str(m.content).strip() for m in reversed(state.get("messages") or [])
+             if isinstance(m, HumanMessage)), ""
+        )
     return {"target_query": query}
 
 
@@ -97,8 +102,7 @@ def locate_article(state: IntroduceState) -> dict:
     )
     query = str(extracted.get("target_query") or state.get("target_query") or "").strip()
     if not query:
-        # 没篇名 = 用户没点名，或抽取失败（已降级成空串）。
-        # 两种都由 compose_intro 统一说"没定位到"。
+        # 连用户原话都没有，无法开始检索。
         return extracted
 
     # ------------------------------------------------------------------
@@ -144,10 +148,15 @@ def locate_article(state: IntroduceState) -> dict:
 
     # 标题没命中 → 向量兜底
     try:
-        hits = search_ids(query) or []
+        hits = search_ids(query)
     except Exception as exc:  # noqa: BLE001 兜底路径不该把介绍拖垮
-        print(f"[introduce] 向量兜底异常，当作没找到：{exc}")
-        hits = []
+        print(f"[introduce] 向量兜底异常，检索未完成：{exc}")
+        hits = None
+
+    if hits is None:
+        return dict(extracted, introduce_failed=True, messages=[AIMessage(
+            content="文章检索这会儿出了点问题，还不能确定有没有这篇。稍后再试一下？"
+        )])
 
     if not hits:
         return extracted
@@ -189,7 +198,16 @@ def _ask_which(rows: list, query: str, tries: int = 2):
         prompt = base if attempt == 0 else (
             "没认出你回的是哪篇。回我**序号**（1、2…）就行：\n" + lines
         )
-        answer = interrupt(prompt)
+        # ⚠️ v1.99（前端 v1.100）：结构化载荷 —— 这一类是**选择题**（要的是序号/篇名本身），
+        #    前端因此**绝不自动续跑**，只把问句上屏、把用户的原话原样回传。
+        #    在结构化载荷之前，前端的判据只能靠 `/回我序号|对上好几篇|.../` 这类正则猜。
+        #    `default=None` 就是明说"前端别替用户答"（`interrupt()` 的返回值不受影响）。
+        answer = interrupt({
+            "value": prompt,
+            "kind": "choice",
+            "options": [str(i) for i in range(1, len(rows) + 1)],
+            "default": None,
+        })
         picked = _match_answer(answer, rows)
         if picked is not None:
             return picked
