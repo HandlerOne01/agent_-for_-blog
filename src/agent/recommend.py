@@ -42,7 +42,9 @@ builder.add_conditional_edges(
     "list_tables", db_ready, {"ok": "call_get_schema", "failed": END}
 )
 builder.add_edge("call_get_schema", "get_schema")
-builder.add_edge("get_schema", "generate_query")
+builder.add_conditional_edges(
+    "get_schema", db_ready, {"ok": "generate_query", "failed": END}
+)
 
 def should_continue(state: RecommendState):
     # 这一轮已经降级 → 直接收场。

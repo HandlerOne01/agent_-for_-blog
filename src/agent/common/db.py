@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 load_dotenv()
 
@@ -42,6 +43,14 @@ def safe_err(exc: BaseException) -> str:
 _db_singleton: Optional[SQLDatabase] = None
 
 
+def is_disconnect(exc: BaseException) -> bool:
+    """只重试明确的连接丢失，不重试认证或 SQL 错误。"""
+    return isinstance(exc, DBAPIError) and (
+        exc.connection_invalidated
+        or (getattr(exc.orig, "args", ()) or (None,))[0] in (2006, 2013, 2055)
+    )
+
+
 def get_db() -> SQLDatabase:
     """首次调用时才真正连库；连不上抛 DBUnavailable。
 
@@ -57,11 +66,18 @@ def get_db() -> SQLDatabase:
     """
     global _db_singleton
     if _db_singleton is None:
-        try:
-            _db_singleton = SQLDatabase.from_uri(db_uri(), max_string_length=-1)
-        except Exception as exc:  # noqa: BLE001 任何连接/握手问题都走同一条降级路径
-            _db_singleton = None
-            raise DBUnavailable(safe_err(exc)) from exc
+        for attempt in range(2):
+            try:
+                _db_singleton = SQLDatabase.from_uri(
+                    db_uri(), max_string_length=-1,
+                    engine_args={"pool_pre_ping": True, "pool_recycle": 300},
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                _db_singleton = None
+                if attempt == 0 and is_disconnect(exc):
+                    continue
+                raise DBUnavailable(safe_err(exc)) from exc
     return _db_singleton
 
 
