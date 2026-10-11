@@ -12,6 +12,11 @@
   ``--allow-production`` 才会写入（默认直接拒绝退出，见 ``--help``）。
 * 幂等：默认 upsert（自然键 ``title + blog_url``），重复运行不会产生重复行；
   ``--replace`` 则先清空目标库的 ``blog`` 表（外键 CASCADE 带走 ``blog_content``）再全量插入。
+* **分批提交 + 断连重连**（默认每 ``--batch-size 10`` 篇提交一次，见 ``upsert_posts()``）：
+  138 篇一个事务在跨公网链路上太脆 —— 链路一抖（``Lost connection`` / ``InterfaceError``）
+  整批回滚，白跑且当场崩。分批之后最多丢最后不足一批的部分，且**已提交的批不重做**。
+  ``SAVEPOINT`` 一律在 ``try`` **内部**建立：写在 try 外面时，建 SAVEPOINT 这一步自己
+  撞上断连就会把异常抛出循环外（这是实测连挂两次的直接原因）。
 
 字段口径
 --------
@@ -29,7 +34,7 @@
 ``has_code``          正文含 ``` 围栏 → 1，否则 0
 ``difficulty``        启发式 1~5，见 ``score_difficulty()`` 注释
 ``blog_type``         category 映射，见 ``CATEGORY_BLOG_TYPE``
-``view_count``        0
+``view_count``        INSERT 时写 0；**UPDATE 分支一个字节都不碰**（见下）
 ``blog_url``          ``https://imiss.example.com/posts/<相对目录>/<slug>/``
 ``status``            ``draft: true`` → 0，否则 1
 ``blog_content``      一篇一行：content=正文 markdown 原文（仅统一换行为 \n、
@@ -37,6 +42,11 @@
                       content_hash=该 content 的 sha256、updated_at=now；
                       toc / code_lang 留空（NULL）
 ====================  ==========================================================
+
+``view_count`` 为什么不能进 UPDATE：它是**线上阅读量**，不是本站从 md 里派生出来的
+字段。早先的 upsert 固定写 12 列（含 ``view_count``），于是每重跑一次就把全表浏览量
+清零 —— 当时库里的值恰好都是 0，所以无损；但以后重跑就是真丢数据。现在语义明确：
+INSERT 给 0（新文章从零开始），UPDATE 只更新 markdown 真能决定的那几列。
 
 用法::
 
@@ -48,6 +58,9 @@
 
     # 只灌 10 篇做抽样
     python scripts/load_blog.py --database my_blog_rebuild --limit 10
+
+    # 每 5 篇提交一次；并演示断连重连（第 2 批人为断一次链路，应当自动重连重试）
+    python scripts/load_blog.py --database my_blog_rebuild --batch-size 5 --fail-batch 2
 """
 
 from __future__ import annotations
@@ -58,6 +71,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -68,6 +82,70 @@ try:
     import pymysql
 except ImportError:  # pragma: no cover - 环境缺依赖时的友好提示
     pymysql = None  # type: ignore[assignment]
+
+#: 断连判据与 agent 侧共用一个实现 —— `src/agent/common/db.py: is_disconnect()`。
+#: 它认的是 `SQLAlchemy DBAPIError.connection_invalidated` 或 pymysql 的
+#: 2006/2013/2055。本脚本拿到的是**裸 pymysql 异常**（没有 SQLAlchemy 包一层），
+#: 所以下面 `_is_disconnect()` 用同一套编号，只是把「读 .orig」换成「读异常自己」。
+try:
+    from src.agent.common.db import is_disconnect as _agent_is_disconnect
+except Exception:  # noqa: BLE001 - 见 _is_disconnect()：拿不到就退回编号判据
+    _agent_is_disconnect = None  # type: ignore[assignment]
+
+#: MySQL 客户端错误码：服务器断开 / 连接丢失 / 连接已失效。
+DISCONNECT_ERRNOS = frozenset({2006, 2013, 2055})
+
+
+def _exc_errno(exc: BaseException) -> int | None:
+    """取 MySQL 错误号（没有就是 None）。
+
+    pymysql 的异常自己带 ``args[0]``；万一被 SQLAlchemy 包了一层（``DBAPIError``），
+    错误号在 ``exc.orig`` 上 —— 两条路都认，本函数才好复用。
+    """
+    for candidate in (exc, getattr(exc, "orig", None)):
+        args = getattr(candidate, "args", None)
+        if args and isinstance(args[0], int):
+            return args[0]
+    return None
+
+
+def _conn_is_dead(conn: Any) -> bool:
+    """连接对象自己还有没有活着的 socket（没有 = 必须重连）。"""
+    if conn is None:
+        return False
+    try:
+        if getattr(conn, "_sock", "missing") is None:
+            return True
+        return getattr(conn, "open", True) is False
+    except Exception:  # noqa: BLE001 - 假连接/其它驱动：判断不了就当没事
+        return False
+
+
+def is_disconnect(exc: BaseException, conn: Any = None) -> bool:
+    """这次异常是不是**明确的连接丢失**（该重连重试），而不是认证/SQL/代码错。
+
+    两条判据，任一命中即算：
+
+    1. `src/agent/common/db.py: is_disconnect()` —— 2006/2013/2055 或
+       `connection_invalidated`。判据只维护一份，agent 侧改了这里跟着改。
+    2. **socket 真的没了**（``conn._sock is None`` / ``conn.open is False``）。
+       为什么必须有第 2 条：真链路上"掉线"有两个阶段 —— 第一次是
+       ``OperationalError(2013, 'Lost connection')``（第 1 条能认），之后这条
+       连接上的任何操作 pymysql 只会抛 ``InterfaceError(0, '')``（错误号是 0，
+       第 1 条认不出来），错误号与"自己代码里用错游标"完全一样、**无法区分**。
+       实测就栽在这里：`--fail-batch` 在真库上第一次跑，第 4 批撞的就是
+       ``InterfaceError(0, '')``，于是不重连、10 篇被记成 `[FAIL]` 后整批崩掉。
+       所以判据不能只看错误号，要看连接对象本身还活着没有 —— 这样既覆盖真掉线，
+       又不会把 "cursor closed" 这类**自己写错**的 InterfaceError 误判成重连。
+
+    认证失败（1045）、SQL 语法/约束错误（1064/1062/1452…）一律不算：
+    重试它们只会把同一个错误再撞一遍，还掩盖真正的原因。
+    """
+    if _agent_is_disconnect is not None and _agent_is_disconnect(exc):
+        return True
+    if _exc_errno(exc) in DISCONNECT_ERRNOS:
+        return True
+    return _conn_is_dead(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +168,14 @@ AUTHOR = "IMiss"
 BLOG_URL_PREFIX = "https://imiss.example.com/posts"
 CONTENT_FMT = "markdown"
 
+#: 每批提交多少篇。跨公网链路（本机 → 106.52.158.48）一个事务跑到头太脆，
+#: 见模块 docstring「分批提交 + 断连重连」。
+DEFAULT_BATCH_SIZE = 10
+#: 断连后最多重连几次（每次重试的都是**同一个当前批**）。
+DEFAULT_RECONNECT_RETRIES = 3
+#: 两次重连尝试之间等多久。远端库偶发抖动，立刻重试往往还是同一个坏时刻。
+RECONNECT_DELAY_SECONDS = 2.0
+
 #: 列宽上限（与生产库 DDL 一致），超长时安全截断并计入 warning。
 MAX_LEN = {"title": 255, "intro": 500, "tags": 255, "topic": 64, "category": 64,
            "blog_type": 32, "author": 64, "blog_url": 512}
@@ -105,6 +191,13 @@ CATEGORY_BLOG_TYPE: dict[str, str] = {
     "STL": "语言笔记",
     "MySQL": "数据库笔记",
     "项目实战": "项目实战",
+    # v1.85（博客侧分类重排，发起人要求）：原「项目实战」拆成两半 ——
+    #   · 「项目梳理」= 原来的项目笔记那 6 篇（只是改名，语义没变）；
+    #   · 「项目实战」= 项目展示页那 3 篇的**文章版**（同一批内容的文章形态）；
+    #   · 「本站维护」= 新增的那篇《本站使用与维护手册》。
+    # ⚠️ 不登记这几项的话 `blog_type` 会静默兜底成「技术笔记」（dry-run 会打 warning）。
+    "项目梳理": "项目实战",
+    "本站维护": "站点维护",
     "AI 应用": "AI 笔记",
 }
 #: 未在映射表里的 category 落到这里。
@@ -541,13 +634,12 @@ def collect_posts(posts_root: Path, limit: int | None) -> tuple[list[Post], list
 # --------------------------------------------------------------------------- #
 
 
-def connect(args: argparse.Namespace) -> "pymysql.connections.Connection":
-    """连接目标库（库名走 --database，凭据取 CLI > 环境变量 > .env）。
+def connect_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """把 CLI / 环境变量 / .env 合成 ``pymysql.connect(**kwargs)`` 的参数。
 
-    先不带 database 连接，再 ``USE``：这样 ``--init-schema`` 时影子库还不存在也能连上。
+    单独抽出来是因为断连重连也要用同一套参数 —— 重连时不能再走一遍
+    ``--init-schema`` 之类的分支，但**必须**连到同一个库。
     """
-    if pymysql is None:
-        raise SystemExit("[FATAL] 需要 pymysql（本项目 .venv 已装，请用 .venv\\Scripts\\python.exe 运行）")
     env = load_env_file(Path(args.env_file))
     host = args.host or os.environ.get("DB_HOST") or env.get("DB_HOST")
     port = args.port or int(os.environ.get("DB_PORT") or env.get("DB_PORT") or 3306)
@@ -555,10 +647,20 @@ def connect(args: argparse.Namespace) -> "pymysql.connections.Connection":
     password = args.password or os.environ.get("DB_PASSWORD") or env.get("DB_PASSWORD")
     if not (host and user and password):
         raise SystemExit(f"[FATAL] 连接信息不全，检查 {args.env_file} 里的 DB_HOST/DB_USER/DB_PASSWORD")
-    conn = pymysql.connect(
-        host=host, port=port, user=user, password=password,
-        charset="utf8mb4", autocommit=False,
-    )
+    return {
+        "host": host, "port": port, "user": user, "password": password,
+        "charset": "utf8mb4", "autocommit": False,
+    }
+
+
+def connect(args: argparse.Namespace) -> "pymysql.connections.Connection":
+    """连接目标库（库名走 --database，凭据取 CLI > 环境变量 > .env）。
+
+    先不带 database 连接，再 ``USE``：这样 ``--init-schema`` 时影子库还不存在也能连上。
+    """
+    if pymysql is None:
+        raise SystemExit("[FATAL] 需要 pymysql（本项目 .venv 已装，请用 .venv\\Scripts\\python.exe 运行）")
+    conn = pymysql.connect(**connect_kwargs(args))
     try:
         with conn.cursor() as cur:
             if args.init_schema:
@@ -574,6 +676,31 @@ def connect(args: argparse.Namespace) -> "pymysql.connections.Connection":
     return conn
 
 
+def connect_with_retry(
+    args: argparse.Namespace, *, retries: int | None = None
+) -> "pymysql.connections.Connection":
+    """连库；**只有明确断连**才重试，其它异常（认证/SQL）照旧抛出。
+
+    重试只包住「建连接」这一步：它是断连重连时唯一需要重做的动作，
+    ``--init-schema`` 那种一次性动作不该被重放。
+    """
+    retries = DEFAULT_RECONNECT_RETRIES if retries is None else max(0, int(retries))
+    last: BaseException | None = None
+    for attempt in range(retries + 1):
+        try:
+            return connect(args)
+        except SystemExit:
+            raise  # 认证/库名/参数问题：不是断连，别重试
+        except Exception as exc:  # noqa: BLE001 - 判据在 is_disconnect()
+            if not is_disconnect(exc) or attempt == retries:
+                raise
+            last = exc
+            print(f"\n  [RECONNECT] 连接失败（{type(exc).__name__}: {exc}），"
+                  f"{RECONNECT_DELAY_SECONDS:.0f}s 后重试（{attempt + 1}/{retries}）")
+            time.sleep(RECONNECT_DELAY_SECONDS)
+    raise AssertionError(f"不可达：{last!r}")  # pragma: no cover - 循环里必 return 或 raise
+
+
 def init_schema(conn: "pymysql.connections.Connection") -> None:
     """按生产库原样创建两张表 + v_blog 视图（幂等，IF NOT EXISTS）。"""
     with conn.cursor() as cur:
@@ -583,69 +710,175 @@ def init_schema(conn: "pymysql.connections.Connection") -> None:
     conn.commit()
 
 
-def upsert_posts(conn: "pymysql.connections.Connection", posts: list[Post]) -> tuple[int, int]:
-    """写入(幂等)：命中 ``(title, blog_url)`` 就 UPDATE，否则 INSERT。
+def _upsert_one(cur: Any, post: Post) -> bool:
+    """写一篇（blog 行 + blog_content 行），返回 ``True``=INSERT / ``False``=UPDATE。
 
-    返回 ``(inserted, updated)``。整批一个事务，单篇失败回滚到该篇的 SAVEPOINT。
+    **不做事务边界管理**：SAVEPOINT 由调用方在本函数外面、``try`` 里面建（见
+    ``upsert_batch`` 里那段注释 —— 建 SAVEPOINT 自己也可能撞上断连）。
+
+    UPDATE 分支刻意**不写 view_count**：那是线上阅读量，不是从 markdown 派生的字段，
+    重跑一次就把它清零等于丢数据。INSERT 时给 0（新文章从零开始）。
+    """
+    cur.execute(
+        "SELECT id FROM blog WHERE title=%s AND blog_url=%s LIMIT 1",
+        (post.title, post.blog_url),
+    )
+    row = cur.fetchone()
+    if row:
+        blog_id = row[0]
+        cur.execute(
+            """UPDATE blog SET topic=%s, category=%s, blog_type=%s, tags=%s,
+                   word_count=%s, has_code=%s, difficulty=%s, author=%s,
+                   intro=%s, publish_date=%s, status=%s
+               WHERE id=%s""",
+            (post.topic, post.category, post.blog_type, post.tags, post.word_count,
+             post.has_code, post.difficulty, AUTHOR, post.intro, post.publish_date,
+             post.status, blog_id),
+        )
+        is_insert = False
+    else:
+        is_insert = True
+        cur.execute(
+            """INSERT INTO blog
+                   (topic, category, blog_type, tags, word_count, has_code,
+                    difficulty, title, author, intro, blog_url, publish_date,
+                    view_count, status)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (post.topic, post.category, post.blog_type, post.tags, post.word_count,
+             post.has_code, post.difficulty, post.title, AUTHOR, post.intro,
+             post.blog_url, post.publish_date, 0, post.status),
+        )
+        blog_id = cur.lastrowid
+    if post.content.strip():
+        cur.execute(
+            """INSERT INTO blog_content
+                   (blog_id, content, content_fmt, toc, code_lang, content_hash, updated_at)
+               VALUES (%s,%s,%s,NULL,NULL,%s,NOW())
+               ON DUPLICATE KEY UPDATE
+                   content=VALUES(content), content_fmt=VALUES(content_fmt),
+                   content_hash=VALUES(content_hash), updated_at=NOW()""",
+            (blog_id, post.content, CONTENT_FMT, post.content_hash),
+        )
+    return is_insert
+
+
+def upsert_batch(
+    conn: "pymysql.connections.Connection", posts: list[Post]
+) -> tuple[int, int]:
+    """写**一批**（调用方负责定批大小），一批 = 一个事务。
+
+    单篇失败回滚到该篇自己的 SAVEPOINT（含它插入的 blog 行），不影响本批其它篇；
+    **断连**不在这里吞掉 —— 往上抛给 ``upsert_posts`` 去重连重试整批
+    （本批尚未 commit，重试时这批什么痕迹都不在，重做是干净的）。
     """
     inserted = updated = 0
     with conn.cursor() as cur:
         for post in posts:
-            cur.execute("SAVEPOINT sp_post")
-            row = None
-            is_insert = False
             try:
-                cur.execute(
-                    "SELECT id FROM blog WHERE title=%s AND blog_url=%s LIMIT 1",
-                    (post.title, post.blog_url),
-                )
-                row = cur.fetchone()
-                if row:
-                    blog_id = row[0]
-                    cur.execute(
-                        """UPDATE blog SET topic=%s, category=%s, blog_type=%s, tags=%s,
-                               word_count=%s, has_code=%s, difficulty=%s, author=%s,
-                               intro=%s, publish_date=%s, view_count=%s, status=%s
-                           WHERE id=%s""",
-                        (post.topic, post.category, post.blog_type, post.tags, post.word_count,
-                         post.has_code, post.difficulty, AUTHOR, post.intro, post.publish_date,
-                         0, post.status, blog_id),
-                    )
-                else:
-                    is_insert = True
-                    cur.execute(
-                        """INSERT INTO blog
-                               (topic, category, blog_type, tags, word_count, has_code,
-                                difficulty, title, author, intro, blog_url, publish_date,
-                                view_count, status)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (post.topic, post.category, post.blog_type, post.tags, post.word_count,
-                         post.has_code, post.difficulty, post.title, AUTHOR, post.intro,
-                         post.blog_url, post.publish_date, 0, post.status),
-                    )
-                    blog_id = cur.lastrowid
-                if post.content.strip():
-                    cur.execute(
-                        """INSERT INTO blog_content
-                               (blog_id, content, content_fmt, toc, code_lang, content_hash, updated_at)
-                           VALUES (%s,%s,%s,NULL,NULL,%s,NOW())
-                           ON DUPLICATE KEY UPDATE
-                               content=VALUES(content), content_fmt=VALUES(content_fmt),
-                               content_hash=VALUES(content_hash), updated_at=NOW()""",
-                        (blog_id, post.content, CONTENT_FMT, post.content_hash),
-                    )
+                # ⚠️ SAVEPOINT 必须在 try **里面**：建 SAVEPOINT 本身就要往服务器发
+                # 一条语句，链路正好在这里断掉时，写在 try 外面会让异常直接冲出
+                # 整个循环（实测两次都是这么挂的：(2013, 'Lost connection') 之后
+                # 跟着 InterfaceError，整批 138 篇一起回滚）。
+                cur.execute("SAVEPOINT sp_post")
+                is_insert = _upsert_one(cur, post)
                 cur.execute("RELEASE SAVEPOINT sp_post")
-                if is_insert:
-                    inserted += 1
-                else:
-                    updated += 1
             except pymysql.err.MySQLError as exc:
-                # 该篇整体回滚（含 blog 行），不影响其他篇
-                cur.execute("ROLLBACK TO SAVEPOINT sp_post")
-                cur.execute("RELEASE SAVEPOINT sp_post")
+                if is_disconnect(exc, conn):
+                    raise  # 交给上层重连重试整批；本批未 commit，无需回滚
+                # 单篇的 SQL 错误（约束/语法/超长…）：回滚这一篇，继续下一批里的下一篇
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_post")
+                    cur.execute("RELEASE SAVEPOINT sp_post")
+                except pymysql.err.MySQLError:
+                    pass  # SAVEPOINT 没建成（就是上面那条断连路径），无需回滚
                 print(f"  [FAIL] {post.source.name}: {type(exc).__name__}: {exc}")
+                continue
+            if is_insert:
+                inserted += 1
+            else:
+                updated += 1
     conn.commit()
     return inserted, updated
+
+
+def upsert_posts(
+    conn: "pymysql.connections.Connection",
+    posts: list[Post],
+    args: argparse.Namespace | None = None,
+    *,
+    batch_size: int | None = None,
+    fail_batch: int | None = None,
+) -> tuple[int, int, "pymysql.connections.Connection"]:
+    """分批 upsert，遇明确断连**重连并重试当前这一批**。
+
+    返回 ``(inserted, updated, conn)`` —— conn 可能是重连后的**新对象**，
+    调用方必须用返回值继续（旧对象已经废了）。
+
+    为什么整批重试是安全的：批内未 commit，断连时服务器侧已随连接断开回滚；
+    已 commit 的批不受影响，也不重做（``next_batch`` 只往前走）。
+
+    ⚠️ 重试次数是**按批**算的（``reconnect_retries`` 次），不是全局的：链路一直
+    不通时，一个"每次重连都成功、写这批就断"的死循环会让脚本永远转下去
+    （写这个函数第一版就踩了，被
+    ``test_gives_up_after_reconnect_retries_and_reraises`` 抓住）。到上限就抛出。
+    """
+    if batch_size is None:
+        batch_size = DEFAULT_BATCH_SIZE
+    batch_size = max(1, int(batch_size))
+    retries = DEFAULT_RECONNECT_RETRIES if args is None else int(
+        getattr(args, "reconnect_retries", DEFAULT_RECONNECT_RETRIES)
+    )
+
+    inserted = updated = 0
+    next_batch = 1
+    i = 0
+    while i < len(posts):
+        batch = posts[i: i + batch_size]
+        attempts = 0
+        while True:
+            try:
+                add_inserted, add_updated = upsert_batch(conn, batch)
+            except pymysql.err.MySQLError as exc:
+                if not is_disconnect(exc, conn):
+                    raise  # 认证 / SQL 错：照旧抛出，不吞
+                if args is None:
+                    raise  # 没给 args 就没法重连（判据/参数都在里面），别装作能重试
+                # ⚠️ close() 自己也会抛：pymysql 对已经关掉的连接抛
+                # `pymysql.err.Error("Already closed")`（错误号是 None），
+                # 而它**不是** MySQLError 的子类 —— 不吞掉就会盖住真正的断连异常，
+                # 直接崩在"善后"这一步上（实测：`--fail-batch` 第一次真跑就是这么挂的）。
+                # 关连接只是善后，失败无所谓：新连接马上会建，老对象反正要丢。
+                try:
+                    conn.close()
+                except Exception as close_exc:  # noqa: BLE001 - 善后失败不该改变结论
+                    print(f"  [warn] 关闭旧连接时又报错（忽略）："
+                          f"{type(close_exc).__name__}: {close_exc}")
+                print(f"\n  [DISCONNECT] 第 {next_batch} 批（{len(batch)} 篇）"
+                      f"写库时链路断开：{type(exc).__name__}: {exc}")
+                print(f"               已提交 {inserted + updated} 篇；本批未 commit"
+                      f"（服务器侧随连接一起回滚），重连后重做是干净的")
+                if attempts >= retries:
+                    raise  # 试满了：把最后一次断连原样抛出，别无声无息地转下去
+                attempts += 1
+                # 每一次重连都只试 1 下：整体次数由上面这个 attempts 控制，
+                # 免得两层各自重试、次数变成乘法。
+                conn = connect_with_retry(args, retries=1)
+                print(f"  [RECONNECT] 已重连，重试第 {next_batch} 批"
+                      f"（第 {attempts}/{retries} 次）")
+                continue  # i 原地不动：重做当前这批
+            inserted += add_inserted
+            updated += add_updated
+            print(f"  [batch {next_batch}] {len(batch)} 篇已提交"
+                  f"（新增 {add_inserted} / 更新 {add_updated}，累计 {inserted + updated}/{len(posts)}）")
+            # --fail-batch：只在本批 commit **之后**人为断链路，用来在真库上演示
+            # 「断连 → 重连 → 只有未提交的那批被重做」。仅用于验证，正常跑不要传。
+            if fail_batch and next_batch == int(fail_batch):
+                print(f"  [--fail-batch] 第 {next_batch} 批提交后人为断连（仅用于验证重连路径）")
+                conn.close()
+            break
+        i += len(batch)
+        next_batch += 1
+    return inserted, updated, conn
 
 
 def replace_all(conn: "pymysql.connections.Connection", database: str) -> None:
@@ -785,6 +1018,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="先按生产库 DDL 建库/建表/建 v_blog 视图（IF NOT EXISTS，幂等）")
     parser.add_argument("--allow-production", action="store_true",
                         help=f"显式允许写生产库 {PRODUCTION_DB}（默认拒绝）")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                        help=f"每批提交多少篇（默认 {DEFAULT_BATCH_SIZE}）。"
+                             "跨公网链路一个事务跑到头太脆，分批 + 断连重连见 upsert_posts()")
+    parser.add_argument("--reconnect-retries", type=int, default=DEFAULT_RECONNECT_RETRIES,
+                        help=f"断连后最多重连几次（默认 {DEFAULT_RECONNECT_RETRIES}），每次重试同一个当前批")
+    parser.add_argument("--fail-batch", type=int, default=None,
+                        help="仅用于验证：在第 N 批**提交之后**人为断开连接，"
+                             "用来演示「断连 → 重连 → 只重做未提交的那批」。正常跑不要传")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE), help=".env 路径")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -810,6 +1051,18 @@ def main(argv: list[str] | None = None) -> int:
     if not posts_root.is_dir():
         print(f"[FATAL] 文章目录不存在: {posts_root}")
         return 2
+    if args.batch_size < 1:
+        print(f"[FATAL] --batch-size 必须 >= 1（收到 {args.batch_size}）")
+        return 2
+    if args.reconnect_retries < 0:
+        print(f"[FATAL] --reconnect-retries 不能为负（收到 {args.reconnect_retries}）")
+        return 2
+    if args.fail_batch is not None and args.database != DEFAULT_SHADOW_DB:
+        # --fail-batch 是**故意**断链路。库名必须恰好是影子库：既挡住生产库，
+        # 也挡住 --database 指向的其它库 —— 别把"测试开关"用在真实数据上。
+        print(f"[REFUSED] --fail-batch 只能配合影子库 {DEFAULT_SHADOW_DB} 使用"
+              f"（当前 --database {args.database}）。本次未执行任何写操作。")
+        return 2
 
     scanned = len(sorted(posts_root.rglob("*.md")))
     if args.limit is not None:
@@ -822,7 +1075,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[dry-run] 未连接数据库，未写入任何数据。")
         return 0
 
-    conn = connect(args)
+    # 首次连接也走重连逻辑：这台远端库的握手本身就会抖（本轮实测真撞到过一次
+    # `OperationalError(2013)` 直接崩在 pymysql.connect 里，还没开始写就结束）。
+    conn = connect_with_retry(args)
+    # 重连可能把 conn 换成新对象（见 upsert_posts 的返回值）。把它记在 main 自己的
+    # 名字上，finally 才关得到**最后那条**；不记录的话会在进程退出时才回收。
+    conns: list[Any] = [conn]
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT DATABASE()")
@@ -832,7 +1090,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[--init-schema] {args.database}: blog / blog_content / v_blog 已就绪")
         if args.replace:
             replace_all(conn, args.database)
-        inserted, updated = upsert_posts(conn, posts)
+        print(f"\n=== 分批写入（每 {args.batch_size} 篇一个事务；"
+              f"断连自动重连，最多 {args.reconnect_retries} 次）===")
+        inserted, updated, conn = upsert_posts(
+            conn, posts, args,
+            batch_size=args.batch_size, fail_batch=args.fail_batch,
+        )
+        conns.append(conn)
 
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM blog")
@@ -859,7 +1123,14 @@ def main(argv: list[str] | None = None) -> int:
             print("[WARN] blog 行数与本次解析篇数不一致，请检查是否有历史残留（可用 --replace 全量重建）")
         return 0
     finally:
-        conn.close()
+        # 每一条用过的连接都关一遍（重连会换新对象）。pymysql 对已关掉的连接抛
+        # Error("Already closed")（不是 MySQLError 子类）—— 这里只是善后，
+        # 关不上就说一声，别用它的异常盖住真正的失败原因。
+        for old in conns:
+            try:
+                old.close()
+            except Exception as close_exc:  # noqa: BLE001 - 善后失败不该改变结论
+                print(f"[warn] 关闭连接时报错（忽略）：{type(close_exc).__name__}: {close_exc}")
 
 
 if __name__ == "__main__":
