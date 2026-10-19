@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./docs/images/readme/banner.svg" alt="Agent for Blog：让每一次提问，都能找到值得读的下一篇。" width="100%" />
+
 
 <h1>Agent for Blog</h1>
 
