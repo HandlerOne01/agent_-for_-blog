@@ -1,8 +1,46 @@
-# Agent for Blog
+<div align="center">
+
+<img src="./docs/images/readme/banner.svg" alt="Agent for Blog：让每一次提问，都能找到值得读的下一篇。" width="100%" />
+
+<h1>Agent for Blog</h1>
+
+<p><b>让每一次提问，都能找到值得读的下一篇。</b></p>
+
+<p><img src="https://img.shields.io/badge/Python-3.11%20%2F%203.12-3776AB?style=flat-square" alt="Python 3.11 / 3.12" /> <img src="https://img.shields.io/badge/LangGraph-Agent-B77699?style=flat-square" alt="LangGraph Agent" /> <img src="https://img.shields.io/badge/MySQL-8.0-4479A1?style=flat-square" alt="MySQL 8.0" /></p>
+
+<p><a href="#功能速览">功能速览</a> · <a href="#工作流程">工作流程</a> · <a href="#快速开始">快速开始</a> · <a href="#用户上下文与多轮对话">接入说明</a> · <a href="./README.en.md">English</a></p>
+
+</div>
+
+---
 
 一个基于 **LangGraph 和 LangChain** 的博客阅读助手，面向博客聊天框或桌宠对话场景。它可以根据用户需求推荐站内文章、讲解指定文章、记录阅读篇幅偏好，并以爱弥斯的人设进行日常对话。
 
 项目使用 MySQL 保存文章元数据与正文，结合分类词匹配、向量召回和 SQL 查询获取候选文章，再生成带有站内链接的答复。当前仓库提供 Agent 后端与调试工具，博客页面和桌宠界面由接入方实现。
+
+## 功能速览
+
+<table>
+  <tr>
+    <td width="33%" valign="top"><b>01 / 理解需求</b><br /><br />推荐文章、讲解正文、查询偏好与日常对话，按意图进入对应流程。</td>
+    <td width="33%" valign="top"><b>02 / 从真实内容回答</b><br /><br />结合分类词、向量与 SQL 检索，并校验文章标题和站内链接。</td>
+    <td width="33%" valign="top"><b>03 / 延续一次对话</b><br /><br />通过中断等待补充条件或文章选择，按用户保存阅读篇幅偏好。</td>
+  </tr>
+</table>
+
+```mermaid
+flowchart LR
+    U[博客聊天框 / 桌宠] --> R[意图路由]
+    R --> A[文章推荐]
+    R --> B[文章介绍]
+    R --> C[偏好查询 / 对话]
+    A --> D[(MySQL / 向量索引)]
+    B --> D
+    D --> V[答复校验与降级]
+    V --> U
+```
+
+> 本仓库提供 Agent 后端；博客页面与桌宠由 [IMiss Blog](https://github.com/HandlerOne01/IMiss_Blog) 接入。向量检索为可选能力，文章推荐和介绍需要可访问的 MySQL 文章库。
 
 ## 主要功能
 
@@ -97,7 +135,7 @@ Python 版本与开发服务安装方式可参考 [LangGraph 本地服务文档]
 ### 1. 获取代码与安装依赖
 
 ```bash
-git clone https://gitee.com/a2186988646/agent_-for_-blog.git
+git clone https://github.com/HandlerOne01/agent_-for_-blog.git
 cd agent_-for_-blog
 python -m venv .venv
 ```
@@ -355,3 +393,14 @@ python -m pytest tests/unit_tests
 ## 许可证
 
 项目使用 [MIT License](LICENSE)，保留了原 LangGraph 模板的许可证声明。
+
+## 相关项目
+
+| 项目 | 这里负责什么 |
+| --- | --- |
+| [IMiss Blog](https://github.com/HandlerOne01/IMiss_Blog) | Astro + Svelte 个人技术博客，提供文章阅读与 AI 桌宠入口。 |
+| [Agent for Blog](https://github.com/HandlerOne01/agent_-for_-blog) | LangGraph 博客助手，负责文章推荐、正文介绍与阅读偏好。 |
+| [Boost Search Engine](https://github.com/HandlerOne01/search_engine) | C++ 文档搜索实践，学习分词、索引与结果排序。 |
+| [Reactor Server](https://github.com/HandlerOne01/my_server) | C++ Linux 网络编程实践，学习连接、事件循环与 HTTP。 |
+
+<p align="center"><sub>记录学习，也把每一次实践留成可以回看的路。</sub></p>
